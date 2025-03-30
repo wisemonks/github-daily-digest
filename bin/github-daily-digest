@@ -1,0 +1,140 @@
+#!/usr/bin/env ruby
+
+# This script uses the github_daily_digest gem to run the daily analysis.
+
+# --- Optional: Load .env for convenience if dotenv gem is available ---
+# This allows users to manage secrets via .env when running the executable,
+# but the core gem library doesn't depend on it.
+begin
+  require 'dotenv/load'
+  # Don't print this in json-only mode
+rescue LoadError
+  # dotenv gem not found, proceed using environment variables set externally.
+end
+# --------------------------------------------------------------------
+
+# Add the lib directory to the load path for running from the repository
+$LOAD_PATH.unshift(File.expand_path('../lib', __dir__))
+
+require 'github_daily_digest' # Load the gem's code from lib/
+require 'logger'
+require 'json'
+require 'fileutils'
+
+begin
+  # Load Configuration with command-line arguments
+  config = GithubDailyDigest::Configuration.new(ARGV)
+  
+  # Show help and exit if requested
+  if config.help_requested
+    puts config.help_text
+    exit(0)
+  end
+
+  # Setup Logger based on configuration
+  logger = if config.output_to_stdout
+    # Use STDOUT for direct output
+    logger = Logger.new(STDOUT)
+    # Format logs without timestamps when outputting to terminal
+    logger.formatter = proc do |severity, datetime, progname, msg|
+      config.json_only ? "" : "[#{severity.ljust(5)}]: #{msg}\n"
+    end
+    logger
+  else
+    # Traditional log file if explicitly requested
+    log_file_path = File.expand_path('daily_digest.log', Dir.pwd)
+    logger = Logger.new(log_file_path, 'daily', 7)
+    logger.formatter = proc do |severity, datetime, progname, msg|
+      "#{datetime.strftime('%Y-%m-%d %H:%M:%S')} [#{severity.ljust(5)}]: #{msg}\n"
+    end
+    puts "Logging to: #{log_file_path}"
+    logger
+  end
+  
+  logger.level = Logger.const_get(config.log_level)
+  
+  # Only output this in verbose mode
+  logger.info("Starting GitHub Daily Digest") unless config.json_only
+
+rescue ArgumentError => e
+  # Configuration errors (missing ENV vars, invalid formats)
+  if config&.json_only
+    puts JSON.pretty_generate({ error: e.message })
+  else
+    puts "Error: #{e.message}"
+    puts "Use --help for usage information"
+  end
+  exit(1)
+rescue => e
+  # Catch other potential setup errors
+  if config&.json_only
+    puts JSON.pretty_generate({ error: e.message })
+  else
+    puts "Initialization Error: #{e.message}"
+    puts e.backtrace.join("\n")
+  end
+  exit(1)
+end
+
+# --- Main Execution ---
+begin
+  # Only output this in verbose mode
+  logger.info("Results will be output directly") unless config.json_only
+  
+  # Create the runner with our configuration
+  runner = GithubDailyDigest::DailyDigestRunner.new(config: config, logger: logger)
+  
+  # Run and get the results
+  results = runner.run
+  
+  # Output results in proper format and destination
+  output_formatter = GithubDailyDigest::OutputFormatter.new(config: config, logger: logger)
+  formatted_output = output_formatter.format(results)
+  
+  # Send to correct destination
+  if config.output_to_stdout
+    # Just output to stdout
+    puts formatted_output
+  else
+    # Save to a log file
+    results_dir = File.expand_path('results', Dir.pwd)
+    FileUtils.mkdir_p(results_dir)
+    
+    # Create appropriate filename with format extension
+    format_ext = config.output_format == 'markdown' ? 'md' : 'json'
+    results_file = File.join(results_dir, "daily_digest_#{Time.now.strftime('%Y%m%d_%H%M%S')}.#{format_ext}")
+    File.write(results_file, formatted_output)
+    logger.info("Results saved to #{results_file}")
+  end
+  
+  logger.info("Execution finished successfully.") unless config.json_only
+  
+  exit(0)
+rescue => e
+  # Handle errors during execution
+  if config&.output_format == 'markdown'
+    error_output = "# Error\n\n"
+    error_output << "**Error Message:** #{e.message}\n\n"
+    error_output << "**Stack Trace:**\n\n```\n#{e.backtrace.join("\n")}\n```\n" unless config&.json_only
+    
+    if config&.output_to_stdout
+      puts error_output
+    else
+      # Try to write to a log file
+      begin
+        results_dir = File.expand_path('results', Dir.pwd)
+        FileUtils.mkdir_p(results_dir)
+        results_file = File.join(results_dir, "error_#{Time.now.strftime('%Y%m%d_%H%M%S')}.md")
+        File.write(results_file, error_output)
+        puts "Error details saved to #{results_file}"
+      rescue
+        puts error_output
+      end
+    end
+  else # Default to JSON
+    error_json = { error: e.message }
+    error_json[:backtrace] = e.backtrace unless config&.json_only
+    puts JSON.pretty_generate(error_json)
+  end
+  exit(1)
+end
