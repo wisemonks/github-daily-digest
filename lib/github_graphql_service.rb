@@ -40,6 +40,8 @@ module GithubDailyDigest
                           message
                           committedDate
                           author {
+                            name
+                            email
                             user {
                               login
                             }
@@ -67,13 +69,27 @@ module GithubDailyDigest
     GRAPHQL
     
     def initialize(token:, logger:, config:)
+      @token = token
       @logger = logger
       @config = config
-      @token = token
-      verify_auth
+      @current_org_name = config.github_org_name.to_s.split(',').first
+      
+      # Set up HTTP client for GraphQL communication
+      @uri = URI.parse(GITHUB_API_URL)
+      @http = Net::HTTP.new(@uri.host, @uri.port)
+      @http.use_ssl = true
+      
+      # Initialize request headers
+      @headers = {
+        'Authorization' => "Bearer #{token}",
+        'Content-Type' => 'application/json',
+        'User-Agent' => 'GitHub-Daily-Digest/1.0'
+      }
+      
+      verify_authentication
     rescue => e
-      @logger.fatal("GitHub GraphQL authentication failed: #{e.message}")
-      raise # Re-raise to stop execution
+      @logger.fatal("GitHub GraphQL initialization failed: #{e.message}")
+      raise
     end
     
     def fetch_members(org_name)
@@ -739,26 +755,222 @@ module GithubDailyDigest
       trending_repos
     end
     
-    private
-    
-    def verify_auth
-      @logger.info("Verifying GitHub GraphQL authentication...")
+    # Fetch code changes for a specific commit
+    def fetch_commit_changes(repo_name, commit_oid)
+      @logger.debug("Fetching code changes for commit: #{commit_oid} in repo: #{repo_name}")
       
       query_string = <<-GRAPHQL
-        query {
-          viewer {
-            login
+        query($owner: String!, $repo: String!, $oid: GitObjectID!) {
+          repository(owner: $owner, name: $repo) {
+            object(oid: $oid) {
+              ... on Commit {
+                oid
+                additions
+                deletions
+                changedFiles
+                # Use commitResourcePath to get the URL that can be used for REST API fallback
+                commitResourcePath
+              }
+            }
           }
         }
       GRAPHQL
       
-      response = execute_query(query_string)
+      # Split the repo name into owner and repo parts
+      owner, repo = repo_name.split('/')
       
-      if response["errors"]
-        raise "GraphQL authentication error: #{response["errors"].map { |e| e["message"] }.join(', ')}"
+      unless owner && repo
+        @logger.error("Invalid repository name format: #{repo_name}. Expected format: 'owner/repo'")
+        return {}
       end
       
-      @logger.info("Authenticated to GitHub GraphQL API as user: #{response["data"]["viewer"]["login"]}")
+      response = execute_query(query_string, variables: { 
+        owner: owner,
+        repo: repo,
+        oid: commit_oid
+      })
+      
+      if response && response["data"] && response["data"]["repository"] && 
+         response["data"]["repository"]["object"]
+        
+        commit_object = response["data"]["repository"]["object"]
+        
+        # Since GraphQL doesn't provide files directly, try to fetch them via REST API
+        files_data = fetch_commit_files_via_rest(owner, repo, commit_oid)
+        
+        return {
+          oid: commit_object["oid"],
+          additions: commit_object["additions"],
+          deletions: commit_object["deletions"],
+          changed_files: commit_object["changedFiles"],
+          files: files_data
+        }
+      end
+      
+      # Return empty hash if we couldn't get the changes
+      @logger.warn("Could not fetch changes for commit: #{commit_oid}")
+      {}
+    rescue => e
+      @logger.error("Error fetching commit changes: #{e.message}")
+      {}
+    end
+    
+    # Fetch commit files using REST API as a fallback
+    def fetch_commit_files_via_rest(owner, repo, commit_oid)
+      @logger.debug("Fetching commit files via REST API for #{owner}/#{repo} commit: #{commit_oid}")
+      
+      begin
+        # Create a new Net::HTTP client instance for REST API access
+        uri = URI.parse("https://api.github.com/repos/#{owner}/#{repo}/commits/#{commit_oid}")
+        http = Net::HTTP.new(uri.host, uri.port)
+        http.use_ssl = true
+        
+        headers = {
+          "Authorization" => "Bearer #{@token}",
+          "User-Agent" => "GitHub-Daily-Digest",
+          "Content-Type" => "application/json"
+        }
+        
+        response = http.get(uri.path, headers)
+        
+        # Check if response is HTML instead of JSON (common error when rate limited or auth issues)
+        if response.body.strip.start_with?('<!DOCTYPE', '<html')
+          raise "Received HTML response instead of JSON. This usually indicates rate limiting or authentication issues. Status: #{response.code}"
+        end
+        
+        # Check for non-200 status codes
+        unless response.code.to_i == 200
+          raise "GitHub API returned non-200 status code: #{response.code}, body: #{response.body[0..100]}"
+        end
+        
+        # Parse the JSON response
+        parsed_response = JSON.parse(response.body)
+        
+        # Extract file details
+        if parsed_response && parsed_response["files"]
+          @logger.debug("Successfully fetched #{parsed_response["files"].count} changed files via REST API")
+          
+          return parsed_response["files"].map do |file|
+            {
+              path: file["filename"],
+              additions: file["additions"],
+              deletions: file["deletions"],
+              patch: file["patch"]
+            }
+          end
+        end
+      rescue => e
+        @logger.error("Error fetching commit files via REST API: #{e.message}")
+      end
+      
+      # Return empty array if REST fallback fails
+      []
+    end
+    
+    # Fetch changes for a batch of commits
+    def fetch_commits_changes(commits, max_commits = 100)
+      return [] if commits.nil? || commits.empty?
+      
+      @logger.info("Fetching code changes for #{[commits.size, max_commits].min} of #{commits.size} commits")
+      
+      # Debug logging to see commit structure
+      if commits.first
+        @logger.debug("Sample commit structure: #{commits.first.inspect}")
+      end
+      
+      # Filter out any commits with invalid structure
+      valid_commits = commits.select do |commit|
+        commit && commit[:repo] && commit[:sha] 
+      end
+      
+      if valid_commits.empty?
+        @logger.warn("No valid commits found with required data (commit hash and repo)")
+        return []
+      end
+      
+      # Log the first valid commit structure
+      if valid_commits.first
+        @logger.debug("Valid commit sample: #{valid_commits.first.inspect}")
+      end
+      
+      # Limit to the most recent commits to avoid overloading the API
+      commits_to_process = valid_commits.sort_by do |c| 
+        Time.parse(c[:date].to_s) rescue Time.now 
+      end.reverse.first(max_commits)
+      
+      commits_with_changes = commits_to_process.map do |commit|
+        begin
+          # Fetch changes for this commit
+          repo_name = commit[:repo]
+          commit_oid = commit[:sha]
+          
+          # Format the repo name correctly for the GitHub API
+          # Determine the correct organization for this repository
+          if repo_name.include?('/')
+            # If repo already has owner/name format, use it as is
+            repo_full_name = repo_name
+          else
+            # If just repo name, add the current organization name
+            org_name = @current_org_name || @config.github_org_name.to_s.split(',').first
+            repo_full_name = "#{org_name}/#{repo_name}"
+          end
+          
+          @logger.debug("Fetching changes for commit #{commit_oid} in repo #{repo_full_name}")
+          
+          changes = fetch_commit_changes(repo_full_name, commit_oid)
+          
+          # Add the changes to the commit data
+          commit.merge(code_changes: changes)
+        rescue => e
+          @logger.error("Error processing commit changes: #{e.message}")
+          # Return the original commit without changes in case of error
+          commit.merge(code_changes: {})
+        end
+      end
+      
+      @logger.info("Successfully fetched changes for #{commits_with_changes.count} commits")
+      commits_with_changes
+    end
+    
+    # Verify GraphQL API authentication and check permissions
+    def verify_authentication
+      @logger.info("Verifying GitHub GraphQL authentication...")
+      
+      # Query to get both the current user's login and viewerHasScopes
+      query = <<-GRAPHQL
+        query {
+          viewer {
+            login
+          }
+          viewerHasScopes(scopes: ["repo", "read:org"])
+        }
+      GRAPHQL
+      
+      response = execute_query(query, variables: {})
+      
+      if response && response['data'] && response['data']['viewer']
+        username = response['data']['viewer']['login']
+        @logger.info("Authenticated to GitHub GraphQL API as user: #{username}")
+        
+        # Check for required scopes
+        has_required_scopes = response['data']['viewerHasScopes'] == true
+        
+        if has_required_scopes
+          @logger.info("Token has required scopes for full access")
+        else
+          @logger.warn("Token may not have all required scopes (repo, read:org)")
+        end
+        
+        return true
+      else
+        error_message = if response && response['errors']
+                          response['errors'].map { |e| e['message'] }.join(', ')
+                        else
+                          "Unknown error"
+                        end
+        @logger.error("Failed to authenticate to GitHub GraphQL API: #{error_message}")
+        raise "GraphQL authentication failed: #{error_message}"
+      end
     end
     
     def execute_query(query_string, variables: {})

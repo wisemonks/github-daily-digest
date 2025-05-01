@@ -10,7 +10,7 @@ module GithubDailyDigest
                 :rate_limit_sleep_base, :time_since, :gemini_model,
                 :json_only, :output_to_stdout, :help_requested,
                 :output_format, :output_destination, :concise_output,
-                :use_graphql
+                :use_graphql, :no_graphql, :specific_users
 
     def initialize(args = nil)
       Dotenv.load
@@ -22,19 +22,21 @@ module GithubDailyDigest
       @output_destination = ENV.fetch('OUTPUT_DESTINATION', 'stdout').downcase # 'stdout' or 'log'
       @concise_output = ENV.fetch('CONCISE_OUTPUT', 'true').downcase == 'true' # Whether to use concise output format (defaults to true)
       @use_graphql = ENV.fetch('USE_GRAPHQL', 'true').downcase == 'true' # Whether to use GraphQL API (defaults to true)
-      
+      @no_graphql = !@use_graphql # Inverse of use_graphql for easier API
+      @specific_users = ENV.fetch('SPECIFIC_USERS', '').split(',').map(&:strip).reject(&:empty?) # Specific users to process
+
       # Parse command line arguments if provided
       parse_command_line_args(args) if args
-      
+
       # Early return if help is requested
       return if @help_requested
-      
+
       # Load environment variables
       load_env_vars
-      
+
       # Validate the configuration
       validate_config
-      
+
       # Calculate the time window
       calculate_time_window
     end
@@ -42,30 +44,33 @@ module GithubDailyDigest
     def help_text
       <<~HELP
         USAGE: github-daily-digest [options]
-        
+
         GitHub Daily Digest generates insights about developer activity using GitHub API and Google's Gemini AI.
-        
+
         Options:
           -h, --help                       Show this help message
           -t, --token TOKEN                GitHub API token (instead of GITHUB_TOKEN env var)
           -g, --gemini-key KEY             Gemini API key (instead of GEMINI_API_KEY env var)
           -o, --org NAME                   GitHub organization name(s) (instead of GITHUB_ORG_NAME env var)
                                            Multiple organizations can be comma-separated (e.g., 'org1,org2,org3')
+          -u, --users USERNAMES            Specific users to process (comma-separated, e.g. 'user1,user2,user3')
+                                           If not specified, all organization members will be processed
           -m, --model MODEL                Gemini model to use (default: gemini-1.5-flash)
           -w, --window DURATION            Time window for fetching data (e.g., '1.day', '12.hours')
           -v, --verbose                    Enable verbose output (instead of JSON-only)
           -l, --log-level LEVEL            Set log level (DEBUG, INFO, WARN, ERROR, FATAL)
           -f, --format FORMAT              Output format: json or markdown (default: json)
           -d, --destination DEST           Output destination: stdout or log (default: stdout)
-          -c, --[no-]concise               Use concise output (overview + combined only, default: true)
-          -q, --[no-]graphql               Use GraphQL API (default: true)
-          
+          -c, --[no-]concise               Use concise output format (overview + combined only, default: true)
+          -q, --[no-]graphql               Use GraphQL API for better performance and data quality (default: true)
+                                           Use --no-graphql to fall back to REST API
+
         Examples:
           github-daily-digest --token YOUR_TOKEN --gemini-key YOUR_KEY --org acme-inc
           github-daily-digest --window 2.days --verbose
           github-daily-digest --format markdown --destination log
           github-daily-digest --org "org1,org2,org3" --format markdown
-          
+
         Environment variables can also be used instead of command-line options:
           GITHUB_TOKEN, GEMINI_API_KEY, GITHUB_ORG_NAME, GEMINI_MODEL, FETCH_WINDOW, LOG_LEVEL,
           OUTPUT_FORMAT, OUTPUT_DESTINATION, CONCISE_OUTPUT, USE_GRAPHQL
@@ -78,7 +83,8 @@ module GithubDailyDigest
       parser = OptionParser.new do |opts|
         opts.banner = "Usage: github-daily-digest [options]"
 
-        opts.on("-h", "--help", "Show help message") do
+        opts.on("-h", "--help", "Show help") do
+          puts help_text
           @help_requested = true
         end
 
@@ -90,11 +96,15 @@ module GithubDailyDigest
           ENV['GEMINI_API_KEY'] = key
         end
 
-        opts.on("-o", "--org NAME", "GitHub organization name") do |org|
+        opts.on("-o", "--org NAME", "GitHub organization name(s)") do |org|
           ENV['GITHUB_ORG_NAME'] = org
         end
 
-        opts.on("-m", "--model MODEL", "Gemini model to use (default: gemini-1.5-flash)") do |model|
+        opts.on("-u", "--users USERNAMES", "Specific users to process (comma-separated)") do |users|
+          @specific_users = users.split(',').map(&:strip).reject(&:empty?)
+        end
+
+        opts.on("-m", "--model MODEL", "Gemini model to use") do |model|
           @gemini_model = model
         end
 
@@ -109,7 +119,7 @@ module GithubDailyDigest
         opts.on("-l", "--log-level LEVEL", "Set log level (DEBUG, INFO, WARN, ERROR, FATAL)") do |level|
           ENV['LOG_LEVEL'] = level
         end
-        
+
         opts.on("-f", "--format FORMAT", "Output format (json, markdown)") do |format|
           @output_format = format.downcase
           unless ['json', 'markdown'].include?(@output_format)
@@ -117,7 +127,7 @@ module GithubDailyDigest
             exit(1)
           end
         end
-        
+
         opts.on("-d", "--destination DEST", "Output destination (stdout, log)") do |dest|
           @output_destination = dest.downcase
           unless ['stdout', 'log'].include?(@output_destination)
@@ -130,9 +140,10 @@ module GithubDailyDigest
         opts.on("-c", "--[no-]concise", "Use concise output format (overview + combined only)") do |concise|
           @concise_output = concise
         end
-        
-        opts.on("-q", "--[no-]graphql", "Use GraphQL API") do |graphql|
+
+        opts.on("-q", "--[no-]graphql", "Use GraphQL API for better performance and data quality") do |graphql|
           @use_graphql = graphql
+          @no_graphql = !graphql
         end
       end
 
@@ -159,7 +170,7 @@ module GithubDailyDigest
 
     def validate_config
       return if @help_requested
-      
+
       raise ArgumentError, "Missing required env var or option: GITHUB_TOKEN" unless @github_token
       raise ArgumentError, "Missing required env var or option: GEMINI_API_KEY" unless @gemini_api_key
       raise ArgumentError, "Missing required env var or option: GITHUB_ORG_NAME" unless @github_org_name
