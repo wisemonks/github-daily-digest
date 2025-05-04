@@ -48,7 +48,7 @@ module GithubDailyDigest
         config: config,
         github_graphql_service: @github_graphql_service
       )
-      @analyzer = ActivityAnalyzer.new(gemini_service: @gemini_service, logger: @logger)
+      @analyzer = ActivityAnalyzer.new(gemini_service: @gemini_service, github_graphql_service: @github_graphql_service, logger: @logger)
     end
 
     def run

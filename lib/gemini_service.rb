@@ -38,23 +38,16 @@ module GithubDailyDigest
       )
     end
 
-    def analyze_activity(username:, commits:, review_count:, time_window_days:)
+    def analyze_activity(username:, commits_with_code:, review_count:, time_window_days:)
       # If there are no commits and no reviews, return empty data
-      if commits.empty? && review_count == 0
+      if commits_with_code.empty? && review_count == 0
         @logger.info("No activity found for #{username} to analyze.")
         return default_no_activity_report
       else
-        @logger.debug("Found activity for #{username}: #{commits.size} commits in repositories: #{commits.map { |c| c[:repo] }.uniq.join(', ')}")
+        @logger.debug("Found activity for #{username}: #{commits_with_code.size} commits in repositories: #{commits_with_code.map { |c| c[:repo] }.uniq.join(', ')}")
       end
 
-      # Fetch actual code changes for a sample of commits to analyze
-      commits_with_code = if @github_graphql_service
-                          @github_graphql_service.fetch_commits_changes(commits)
-                        else
-                          @logger.debug("GraphQL service not available, proceeding without detailed commit changes")
-                          commits
-                        end
-      
+  
       # Make multiple attempts to analyze with Gemini, handle errors gracefully
       begin
         prompt = build_prompt(username, commits_with_code, review_count, time_window_days)
@@ -68,99 +61,12 @@ module GithubDailyDigest
         else
           # Failure occurred within execute_gemini_request (already logged)
           @logger.warn("Gemini analysis failed for #{username}, using fallback analysis.")
-          return create_fallback_analysis(username, commits, review_count)
+          return create_fallback_analysis(username, commits_with_code, review_count)
         end
       rescue => e
         @logger.error("Unexpected error analyzing #{username}'s activity: #{e.message}")
         @logger.warn("Using fallback analysis due to error.")
-        return create_fallback_analysis(username, commits, review_count)
-      end
-    end
-
-    def analyze_user_activity(username, user_data)
-      @logger.info("Analyzing activity for user: #{username}")
-      
-      # Return early if no data
-      return {} if user_data.nil? || user_data.empty?
-      
-      # Extract relevant data for analysis
-      commits = user_data[:commits] || []
-      reviews = user_data[:reviews] || []
-      
-      if commits.empty? && reviews.empty?
-        @logger.info("No activity found for user: #{username}")
-        return {}
-      end
-      
-      review_count = reviews.size
-      @logger.info("Fetching code changes for #{commits.size} of #{commits.size} commits")
-      
-      # Fetch detailed commit changes for all commits
-      commit_changes = []
-      all_files = []
-      
-      commits.each do |commit|
-        # Skip commits without necessary information
-        next unless commit[:repo_name] && commit[:sha]
-        
-        changes = @github_graphql_service.fetch_commit_changes(commit[:repo_name], commit[:sha])
-        
-        if changes && !changes.empty?
-          commit_changes << changes
-          
-          # Collect files for language analysis
-          if changes[:files] && !changes[:files].empty?
-            all_files.concat(changes[:files])
-          end
-        end
-      end
-      
-      @logger.info("Successfully fetched changes for #{commit_changes.size} commits")
-      
-      # Calculate language distribution
-      language_stats = {}
-      require_relative './language_analyzer'
-      language_stats = LanguageAnalyzer.calculate_distribution(all_files)
-      
-      if commit_changes.empty?
-        @logger.warn("No commit changes found for user: #{username}")
-        
-        # Create fallback analysis for users with review activity but no commit activity
-        if review_count > 0
-          fallback = create_fallback_analysis(username, [], review_count)
-          fallback["language_distribution"] = {}
-          return fallback
-        end
-        
-        return {}
-      end
-      
-      # Perform Gemini analysis
-      begin
-        # Package commit data for analysis
-        analysis_data = {
-          username: username,
-          commits: commit_changes,
-          reviews: review_count
-        }
-        
-        analysis_result = analyze_activity(analysis_data[:username], analysis_data[:commits], analysis_data[:reviews], 30)
-        
-        # Add language distribution to the analysis result
-        if analysis_result
-          analysis_result["language_distribution"] = language_stats
-        end
-        
-        # Return the completed analysis
-        analysis_result || create_fallback_analysis(username, commit_changes, review_count)
-      rescue => e
-        @logger.error("Error analyzing user activity for #{username}: #{e.message}")
-        @logger.error(e.backtrace.join("\n"))
-        
-        # Create fallback analysis in case of error
-        fallback = create_fallback_analysis(username, commit_changes, review_count)
-        fallback["language_distribution"] = language_stats
-        fallback
+        return create_fallback_analysis(username, commits_with_code, review_count)
       end
     end
 

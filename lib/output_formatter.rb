@@ -251,24 +251,21 @@ module GithubDailyDigest
             org_data = user[:org_details][org_name]
             next unless org_data
             
-            if org_data[:data]["language_distribution"].is_a?(Hash) && !org_data[:data]["language_distribution"].empty?
-              org_data[:data]["language_distribution"].each do |lang, percentage|
+            if org_data[:data][:language_distribution].is_a?(Hash) && !org_data[:data][:language_distribution].empty?
+              org_data[:data][:language_distribution].each do |lang, percentage|
                 all_languages[lang] ||= 0
                 all_languages[lang] += percentage.to_f
               end
             end
           end
-          
+
           if all_languages.any?
             # Normalize percentages
             total = all_languages.values.sum
             all_languages.each { |lang, value| all_languages[lang] = (value / total * 100) }
             
-            markdown << "**Languages Used:**\n\n"
-            all_languages.sort_by { |_, v| -v }.each do |lang, percentage|
-              markdown << "- #{lang}: #{percentage.round(1)}%\n"
-            end
-            markdown << "\n"
+            # Use the new function to generate visual language distribution
+            markdown << generate_language_distribution_markdown(all_languages)
           end
           
           # Add recent commit messages combining from all orgs
@@ -310,6 +307,34 @@ module GithubDailyDigest
         end
       end
       
+      return markdown
+    end
+
+    # Generate a visual representation of language distribution for markdown
+    def generate_language_distribution_markdown(languages)
+      return "" if languages.nil? || !languages.is_a?(Hash) || languages.empty?
+      
+      markdown = "**Languages Used:**\n\n"
+      
+      # Sort languages by percentage (highest first)
+      sorted_languages = languages.sort_by { |_, v| -v }
+      
+      # Calculate the max bar width (in characters)
+      max_bar_width = 30
+      
+      sorted_languages.each do |lang, percentage|
+        # Calculate bar width based on percentage
+        bar_width = (percentage * max_bar_width / 100.0).round
+        bar = "█" * bar_width
+        
+        # Format the percentage to one decimal place
+        formatted_percentage = percentage.round(1)
+        
+        # Add the language bar
+        markdown << "- **#{lang}**: #{formatted_percentage}% #{bar}\n"
+      end
+      
+      markdown << "\n"
       return markdown
     end
 
