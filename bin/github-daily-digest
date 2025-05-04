@@ -112,7 +112,7 @@ begin
   exit(0)
 rescue => e
   # Handle errors during execution
-  if config&.output_format == 'markdown'
+  if config&.output_formats&.include?('markdown')
     error_output = "# Error\n\n"
     error_output << "**Error Message:** #{e.message}\n\n"
     error_output << "**Stack Trace:**\n\n```\n#{e.backtrace.join("\n")}\n```\n" unless config&.json_only

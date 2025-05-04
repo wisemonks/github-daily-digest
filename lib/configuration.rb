@@ -9,8 +9,10 @@ module GithubDailyDigest
                 :log_level, :fetch_window_duration, :max_api_retries,
                 :rate_limit_sleep_base, :time_since, :gemini_model,
                 :json_only, :output_to_stdout, :help_requested,
-                :output_format, :output_destination, :concise_output,
-                :use_graphql, :no_graphql, :specific_users
+                :output_formats, :output_destination, :concise_output,
+                :use_graphql, :no_graphql, :specific_users,
+                :html_theme, :html_title, :html_show_charts,
+                :time_window_days
 
     def initialize(args = nil)
       Dotenv.load
@@ -18,12 +20,23 @@ module GithubDailyDigest
       @output_to_stdout = true # Default to stdout
       @gemini_model = ENV.fetch('GEMINI_MODEL', 'gemini-1.5-flash')
       @help_requested = false
-      @output_format = ENV.fetch('OUTPUT_FORMAT', 'json').downcase # 'json' or 'markdown'
+      
+      # Support multiple output formats - if env specifies a single format, convert to array
+      output_format_env = ENV.fetch('OUTPUT_FORMAT', 'json').downcase
+      @output_formats = output_format_env.include?(',') ? 
+                      output_format_env.split(',').map(&:strip).map(&:downcase) : 
+                      [output_format_env.downcase]
+      
       @output_destination = ENV.fetch('OUTPUT_DESTINATION', 'stdout').downcase # 'stdout' or 'log'
       @concise_output = ENV.fetch('CONCISE_OUTPUT', 'true').downcase == 'true' # Whether to use concise output format (defaults to true)
       @use_graphql = ENV.fetch('USE_GRAPHQL', 'true').downcase == 'true' # Whether to use GraphQL API (defaults to true)
       @no_graphql = !@use_graphql # Inverse of use_graphql for easier API
       @specific_users = ENV.fetch('SPECIFIC_USERS', '').split(',').map(&:strip).reject(&:empty?) # Specific users to process
+      
+      # HTML-specific options
+      @html_theme = ENV.fetch('HTML_THEME', 'default').downcase # 'default', 'dark', or 'light'
+      @html_title = ENV.fetch('HTML_TITLE', nil) # Custom title for HTML output
+      @html_show_charts = ENV.fetch('HTML_SHOW_CHARTS', 'true').downcase == 'true' # Whether to show charts in HTML output
 
       # Parse command line arguments if provided
       parse_command_line_args(args) if args
@@ -59,11 +72,17 @@ module GithubDailyDigest
           -w, --window DURATION            Time window for fetching data (e.g., '1.day', '12.hours')
           -v, --verbose                    Enable verbose output (instead of JSON-only)
           -l, --log-level LEVEL            Set log level (DEBUG, INFO, WARN, ERROR, FATAL)
-          -f, --format FORMAT              Output format: json or markdown (default: json)
+          -f, --format FORMAT              Output format: json, markdown, html (default: json)
+                                           html option generates a standalone web page with charts
           -d, --destination DEST           Output destination: stdout or log (default: stdout)
           -c, --[no-]concise               Use concise output format (overview + combined only, default: true)
           -q, --[no-]graphql               Use GraphQL API for better performance and data quality (default: true)
                                            Use --no-graphql to fall back to REST API
+          
+          HTML Output Options:
+          --html-theme THEME               Theme for HTML output: default, dark, light (default: default)
+          --html-title TITLE               Custom title for HTML output
+          --[no-]html-charts               Include interactive charts in HTML output (default: true)
 
         Examples:
           github-daily-digest --token YOUR_TOKEN --gemini-key YOUR_KEY --org acme-inc
@@ -75,6 +94,28 @@ module GithubDailyDigest
           GITHUB_TOKEN, GEMINI_API_KEY, GITHUB_ORG_NAME, GEMINI_MODEL, FETCH_WINDOW, LOG_LEVEL,
           OUTPUT_FORMAT, OUTPUT_DESTINATION, CONCISE_OUTPUT, USE_GRAPHQL
       HELP
+    end
+
+    # Check if we need to show help
+    def help_requested?
+      @help_requested
+    end
+    
+    # Returns number of days in the configured time window
+    def time_window_days
+      if @fetch_window_duration
+        # Handle ActiveSupport::Duration objects
+        if @fetch_window_duration.respond_to?(:in_days)
+          return @fetch_window_duration.in_days.to_i
+        # Handle string durations like '7.days'
+        elsif @fetch_window_duration.is_a?(String)
+          match = @fetch_window_duration.match(/(\d+)\.days/)
+          return match ? match[1].to_i : 7
+        end
+      end
+      
+      # Default to 7 days if fetch_window_duration not set or has unexpected type
+      return 7
     end
 
     private
@@ -120,10 +161,10 @@ module GithubDailyDigest
           ENV['LOG_LEVEL'] = level
         end
 
-        opts.on("-f", "--format FORMAT", "Output format (json, markdown)") do |format|
-          @output_format = format.downcase
-          unless ['json', 'markdown'].include?(@output_format)
-            puts "Error: Invalid output format '#{format}'. Must be 'json' or 'markdown'."
+        opts.on("-f", "--format FORMAT", "Output format (json, markdown, html)") do |format|
+          @output_formats = format.downcase.split(',').map(&:strip).map(&:downcase)
+          unless @output_formats.all? { |f| ['json', 'markdown', 'html'].include?(f) }
+            puts "Error: Invalid output format(s) '#{format}'. Must be one or more of 'json', 'markdown', or 'html'."
             exit(1)
           end
         end
@@ -144,6 +185,23 @@ module GithubDailyDigest
         opts.on("-q", "--[no-]graphql", "Use GraphQL API for better performance and data quality") do |graphql|
           @use_graphql = graphql
           @no_graphql = !graphql
+        end
+        
+        # HTML-specific options
+        opts.on("--html-theme THEME", "Theme for HTML output (default, dark, light)") do |theme|
+          unless ['default', 'dark', 'light'].include?(theme.downcase)
+            puts "Error: Invalid HTML theme '#{theme}'. Must be 'default', 'dark', or 'light'."
+            exit(1)
+          end
+          @html_theme = theme.downcase
+        end
+        
+        opts.on("--html-title TITLE", "Custom title for HTML output") do |title|
+          @html_title = title
+        end
+        
+        opts.on("--[no-]html-charts", "Include interactive charts in HTML output") do |show_charts|
+          @html_show_charts = show_charts
         end
       end
 

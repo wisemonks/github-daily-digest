@@ -335,7 +335,7 @@ module GithubDailyDigest
       repo_cursor = nil
       repo_has_next_page = true
       repo_count = 0
-      max_repos_to_process = 50 # Safety limit to prevent infinite loops
+      max_repos_to_process = 100 # Increased from 50 to allow for more repos
 
       # Convert since_time to ISO8601 format string
       # Handle both Time objects and strings
@@ -381,77 +381,168 @@ module GithubDailyDigest
             next
           end
     
-          # Process each branch (ref)
-          branch_count = 0
-          repo_node['refs']['nodes'].each do |ref_node|
-            branch_count += 1
-            branch_name = ref_node['name']
-            @logger.debug("Processing branch #{branch_count}: #{branch_name} in repo: #{repo_name}")
-    
-            target = ref_node['target']
-            next unless target && target['history'] && target['history']['nodes']
-
-            # Count commits in this branch
-            commit_count = 0
-            commit_found = false
-    
-            # Process each commit in this branch
-            target['history']['nodes'].each do |commit_node|
-              commit_count += 1
-              commit_found = true
-    
-              # Extract author details - handle both formats
-              # First try the user.login format from the GraphQL query
-              github_login = commit_node.dig('author', 'user', 'login')
-    
-              # If that's not available, fall back to name/email
-              author_details = if github_login
-                                 # If we have a GitHub login, use that as the primary identifier
-                                 { name: github_login, email: nil }
-                               else
-                                 # Otherwise use the name/email from the commit
-                                 { 
-                                   name: commit_node.dig('author', 'name'),
-                                   email: commit_node.dig('author', 'email')
-                                 }
-                               end
-
-              # Create the commit payload with nested structure
-              commit_payload = {
-                repo: repo_name,
-                branch: branch_name,
-                commit: {
-                  oid: commit_node['oid'],
-                  message: commit_node['message'],
-                  committedDate: commit_node['committedDate'],
-                  author: author_details,
-                  additions: commit_node['additions'],
-                  deletions: commit_node['deletions'],
-                  changedFiles: commit_node['changedFiles'] || 0
-                }
-              }
-    
-              # Log the author information for debugging
-              @logger.debug("Commit in #{repo_name}/#{branch_name} by author: #{author_details[:name] || 'unknown'}")
-    
-              all_commits << commit_payload
+          # Process each branch with pagination support
+          branch_cursor = nil
+          branch_has_next_page = repo_node['refs']['pageInfo']['hasNextPage']
+          branch_nodes = repo_node['refs']['nodes']
+          
+          # Process initial set of branches
+          process_branches_for_repo(repo_name, branch_nodes, all_commits)
+          
+          # Continue fetching more branches if available
+          while branch_has_next_page
+            @logger.info("Fetching additional branches for repo: #{repo_name}")
+            branch_variables = { 
+              orgName: org_name, 
+              since: since_iso8601, 
+              repoCursor: nil,  # We're targeting a specific repo
+              refCursor: branch_cursor 
+            }
+            
+            branch_response = execute_query(ALL_BRANCH_COMMITS_QUERY, variables: branch_variables)
+            
+            # Break if we can't get valid branch data
+            unless branch_response && branch_response['data'] && 
+                   branch_response['data']['organization'] && 
+                   branch_response['data']['organization']['repositories'] &&
+                   branch_response['data']['organization']['repositories']['nodes']
+              @logger.error("Failed to fetch additional branches or invalid response")
+              break
             end
-    
-            if commit_found
-              @logger.info("Found #{commit_count} commits in #{repo_name}/#{branch_name}")
+            
+            # Get the specific repo from the response
+            target_repo = nil
+            branch_response['data']['organization']['repositories']['nodes'].each do |repo|
+              if repo['name'] == repo_name
+                target_repo = repo
+                break
+              end
             end
+            
+            # No target repo found, break
+            unless target_repo && target_repo['refs']
+              @logger.warn("Couldn't find #{repo_name} in the branch pagination response")
+              break
+            end
+            
+            # Process the new set of branches
+            branch_nodes = target_repo['refs']['nodes']
+            branch_page_info = target_repo['refs']['pageInfo']
+            branch_has_next_page = branch_page_info['hasNextPage']
+            branch_cursor = branch_page_info['endCursor']
+            
+            # Process this page of branches
+            process_branches_for_repo(repo_name, branch_nodes, all_commits)
           end
         end
-    
+
         @logger.info("Processed repository page #{repo_count}, found #{all_commits.size} commits so far. Next page: #{repo_has_next_page}")
-    
-        # Break after first page for now to avoid long-running queries
-        # Remove this line for production use if you need to process all repositories
-        break unless repo_has_next_page
+        
+        # Remove break statement to process all repository pages
+        # break unless repo_has_next_page
       end
 
       @logger.info("Completed fetching commits. Found #{all_commits.size} commits across all branches since #{since_time}")
       all_commits
+    end
+    
+    # Helper method to process branches for a repository
+    def process_branches_for_repo(repo_name, branch_nodes, all_commits)
+      branch_count = 0
+      
+      branch_nodes.each do |ref_node|
+        branch_count += 1
+        branch_name = ref_node['name']
+        @logger.debug("Processing branch #{branch_count}: #{branch_name} in repo: #{repo_name}")
+
+        target = ref_node['target']
+        next unless target && target['history'] && target['history']['nodes']
+
+        # Process each commit in this branch with pagination
+        process_commits_for_branch(repo_name, branch_name, target['history'], all_commits)
+        
+        # Handle commit pagination
+        commit_cursor = target['history']['pageInfo']['endCursor'] 
+        commit_has_next_page = target['history']['pageInfo']['hasNextPage']
+        
+        # Fetch additional pages of commits if available
+        while commit_has_next_page
+          @logger.debug("Fetching additional commits for #{repo_name}/#{branch_name}")
+          
+          # Fetch the next page of commits
+          commit_variables = {
+            owner: repo_name.split('/').first,
+            name: repo_name.split('/').last,
+            branch: branch_name,
+            since: since_time.is_a?(Time) ? since_time.iso8601 : since_time,
+            cursor: commit_cursor,
+            limit: 100
+          }
+          
+          # This query would need to be defined elsewhere or use a different approach
+          # For now we'll log that we would fetch more commits
+          @logger.info("Would fetch additional commits for #{repo_name}/#{branch_name} after cursor #{commit_cursor}")
+          
+          # Break for now - this would need a separate implementation
+          break
+        end
+      end
+      
+      if branch_count > 0
+        @logger.info("Processed #{branch_count} branches in #{repo_name}")
+      end
+    end
+    
+    # Helper method to process commits for a branch
+    def process_commits_for_branch(repo_name, branch_name, history_data, all_commits)
+      commit_count = 0
+      commit_found = false
+
+      # Process each commit in this branch
+      history_data['nodes'].each do |commit_node|
+        commit_count += 1
+        commit_found = true
+
+        # Extract author details - handle both formats
+        # First try the user.login format from the GraphQL query
+        github_login = commit_node.dig('author', 'user', 'login')
+
+        # If that's not available, fall back to name/email
+        author_details = if github_login
+                           # If we have a GitHub login, use that as the primary identifier
+                           { name: github_login, email: nil }
+                         else
+                           # Otherwise use the name/email from the commit
+                           { 
+                             name: commit_node.dig('author', 'name'),
+                             email: commit_node.dig('author', 'email')
+                           }
+                         end
+
+        # Create the commit payload with nested structure
+        commit_payload = {
+          repo: repo_name,
+          branch: branch_name,
+          commit: {
+            oid: commit_node['oid'],
+            message: commit_node['message'],
+            committedDate: commit_node['committedDate'],
+            author: author_details,
+            additions: commit_node['additions'],
+            deletions: commit_node['deletions'],
+            changedFiles: commit_node['changedFiles'] || 0
+          }
+        }
+
+        # Log the author information for debugging
+        @logger.debug("Commit in #{repo_name}/#{branch_name} by author: #{author_details[:name] || 'unknown'}")
+
+        all_commits << commit_payload
+      end
+
+      if commit_found
+        @logger.info("Found #{commit_count} commits in #{repo_name}/#{branch_name}")
+      end
     end
     
     # Maps commits to users
@@ -936,13 +1027,12 @@ module GithubDailyDigest
     def verify_authentication
       @logger.info("Verifying GitHub GraphQL authentication...")
       
-      # Query to get both the current user's login and viewerHasScopes
+      # Simple query to verify authentication - viewerHasScopes doesn't exist in GitHub's GraphQL API
       query = <<-GRAPHQL
         query {
           viewer {
             login
           }
-          viewerHasScopes(scopes: ["repo", "read:org"])
         }
       GRAPHQL
       
@@ -952,14 +1042,8 @@ module GithubDailyDigest
         username = response['data']['viewer']['login']
         @logger.info("Authenticated to GitHub GraphQL API as user: #{username}")
         
-        # Check for required scopes
-        has_required_scopes = response['data']['viewerHasScopes'] == true
-        
-        if has_required_scopes
-          @logger.info("Token has required scopes for full access")
-        else
-          @logger.warn("Token may not have all required scopes (repo, read:org)")
-        end
+        # We can't check scopes via GraphQL, so we'll use a separate method to check token scopes
+        check_token_scopes
         
         return true
       else
@@ -970,6 +1054,36 @@ module GithubDailyDigest
                         end
         @logger.error("Failed to authenticate to GitHub GraphQL API: #{error_message}")
         raise "GraphQL authentication failed: #{error_message}"
+      end
+    end
+    
+    # Check token scopes using REST API since GraphQL doesn't provide this information
+    def check_token_scopes
+      begin
+        uri = URI.parse("https://api.github.com/user")
+        http = Net::HTTP.new(uri.host, uri.port)
+        http.use_ssl = true
+        
+        request = Net::HTTP::Get.new(uri.request_uri)
+        request["Authorization"] = "Bearer #{@token}"
+        request["User-Agent"] = "GitHub-Daily-Digest/1.0"
+        
+        response = http.request(request)
+        
+        if response.code == "200"
+          scopes = response["X-OAuth-Scopes"]&.split(", ") || []
+          @logger.info("Token scopes: #{scopes.join(', ')}")
+          @logger.info("Token has repo scope: #{scopes.include?('repo')}")
+          @logger.info("Token has org read scope: #{scopes.include?('read:org')}")
+          
+          return true
+        else
+          @logger.warn("Could not verify token scopes: HTTP #{response.code}")
+          return false
+        end
+      rescue => e
+        @logger.warn("Error checking token scopes: #{e.message}")
+        return false
       end
     end
     

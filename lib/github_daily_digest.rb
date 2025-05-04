@@ -8,6 +8,7 @@ require_relative "gemini_service"
 require_relative "activity_analyzer"
 require_relative "daily_digest_runner"
 require_relative "output_formatter"
+require_relative "html_formatter"
 
 module GithubDailyDigest
   class Error < StandardError; end

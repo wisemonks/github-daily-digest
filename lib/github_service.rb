@@ -36,6 +36,23 @@ module GithubDailyDigest
       @logger.error("Organization '#{org_name}' not found or token lacks permission. Error: #{e.message}")
       []
     end
+    
+    # Get information about the authenticated user
+    def get_current_user
+      handle_api_errors do
+        user = @client.user
+        {
+          login: user.login,
+          name: user.name,
+          email: user.email,
+          avatar_url: user.avatar_url,
+          scopes: @client.scopes
+        }
+      end
+    rescue => e
+      @logger.error("Failed to get current user information: #{e.message}")
+      nil
+    end
 
     def fetch_org_repos(org_name)
       @logger.info("Fetching repositories for organization: #{org_name}")

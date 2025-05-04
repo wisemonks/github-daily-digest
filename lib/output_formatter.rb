@@ -5,14 +5,21 @@ module GithubDailyDigest
       @logger = logger
     end
 
-    def format(results)
-      case @config.output_format
+    def format(results, format_type = nil)
+      # If a specific format_type is provided, use that
+      # Otherwise, use the first format from the config
+      output_format = format_type || (@config.output_formats&.first || 'json')
+      
+      case output_format
       when 'json'
         format_as_json(results)
       when 'markdown'
         format_as_markdown(results)
+      when 'html'
+        # HTML formatting is handled by HtmlFormatter but we need to recognize it as valid
+        format_as_json(results) # Return JSON data that HtmlFormatter will use
       else
-        @logger.warn("Unknown output format: #{@config.output_format}, defaulting to JSON")
+        @logger.warn("Unknown output format: #{output_format}, defaulting to JSON")
         format_as_json(results)
       end
     end
@@ -24,276 +31,286 @@ module GithubDailyDigest
     end
 
     def format_as_markdown(results)
-      @logger.debug("Starting markdown formatting")
-      
+      # Create a very simplistic markdown output for robustness
       markdown = "# GitHub Activity Digest\n\n"
-      markdown << "Generated on: #{Time.now.strftime('%Y-%m-%d %H:%M:%S')}\n\n"
       
-      # Process all organizations and combine user data
-      combined_users, users_with_gemini_activity, inactive_users, commits_by_user = self.class.process_data(results, @logger)
+      # Extract generation time or use current time
+      generated_at = if results.is_a?(Hash) && results[:_meta].is_a?(Hash) && results[:_meta][:generated_at].is_a?(String)
+                       results[:_meta][:generated_at]
+                     else
+                       Time.now.strftime("%Y-%m-%d %H:%M:%S")
+                     end
       
-      # Calculate overall statistics
-      total_commits = 0
-      total_prs = 0
-      total_active_users = 0
-      total_repos = 0
-      active_repos = []
+      markdown << "Generated on: #{generated_at}\n\n"
       
-      results.each do |org_name, org_data|
-        next if org_name == :_meta
+      # Add summary statistics section if available
+      if results.is_a?(Hash) && (results["summary_statistics"].is_a?(Hash) || results[:summary_statistics].is_a?(Hash))
+        stats = results["summary_statistics"] || results[:summary_statistics]
         
-        # Skip if org_data is not a hash
-        next unless org_data.is_a?(Hash)
+        markdown << "## Summary Statistics\n\n"
         
-        # Count users with changes > 0
-        active_users_in_org = 0
-        
-        org_data.each do |user_key, user_data|
-          # Skip metadata and non-hash user data
-          next if user_key == :_meta || !user_data.is_a?(Hash)
-          
-          changes = 0
-          changes = user_data[:changes].to_i if user_data[:changes]
-          changes = user_data["changes"].to_i if user_data["changes"] && changes == 0
-          
-          active_users_in_org += 1 if changes > 0
+        # Add AI summary if available
+        if stats["ai_summary"].is_a?(String)
+          markdown << "> #{stats["ai_summary"]}\n\n"
         end
         
-        total_active_users += active_users_in_org
-        
-        # Get repository statistics if available
-        if org_data[:_meta] && org_data[:_meta][:repo_stats]
-          repo_stats = org_data[:_meta][:repo_stats]
-          
-          if repo_stats.is_a?(Array)
-            repo_stats.each do |repo|
-              next unless repo.is_a?(Hash)
-              
-              total_repos += 1
-              total_commits += repo[:total_commits].to_i if repo[:total_commits]
-              total_prs += repo[:open_prs].to_i if repo[:open_prs]
-              
-              if repo[:total_commits].to_i > 0 && repo[:name]
-                active_repos << "#{org_name}/#{repo[:name]}"
-              end
-            end
-          elsif repo_stats.is_a?(Hash)
-            # Handle case where repo_stats is a hash instead of an array
-            repo_stats.each do |repo_name, stats|
-              next unless stats.is_a?(Hash)
-              
-              total_repos += 1
-              total_commits += stats[:total_commits].to_i if stats[:total_commits]
-              total_prs += stats[:open_prs].to_i if stats[:open_prs]
-              
-              if stats[:total_commits].to_i > 0
-                active_repos << "#{org_name}/#{repo_name}"
-              end
-            end
-          end
-        end
-      end
-      
-      # Add overview information
-      markdown << "## Overview\n\n"
-      markdown << "| Category | Value |\n"
-      markdown << "| --- | --- |\n"
-      
-      if results.key?(:error)
-        markdown << "## Error\n\n"
-        markdown << "#{results[:error]}\n\n"
-        return markdown
-      end
-      
-      # Determine time period from time_since format
-      time_period = if @config.time_since
-        begin
-          since_time = Time.parse(@config.time_since)
-          days_ago = ((Time.now - since_time) / 86400).round
-          if days_ago < 2
-            "Last 24 hours"
-          else
-            "Last #{days_ago} days"
-          end
-        rescue
-          "Recent activity"
-        end
-      else
-        "Recent activity"
-      end
-      
-      # Get all organizations from the results
-      organizations = results.keys.reject { |k| k == :_meta }
-      
-      markdown << "| **Time Period** | #{time_period} |\n"
-      markdown << "| **Organizations** | #{organizations.join(', ')} |\n"
-      markdown << "| **Data Source** | #{results[:_meta] && results[:_meta][:api_type] ? results[:_meta][:api_type] : 'GitHub API'} |\n\n"
-      
-      # Add trending repositories section if available
-      if results[:_meta] && results[:_meta][:trending_repos] && !results[:_meta][:trending_repos].empty?
-        markdown << "## Trending Repositories\n\n"
-        markdown << "| Repository | Activity Score | Commits | PRs | Issues | Stars |\n"
-        markdown << "| --- | --- | --- | --- | --- | --- |\n"
-        
-        results[:_meta][:trending_repos].each do |repo|
-          markdown << "| **#{repo[:full_name]}** | #{repo[:activity_score]} | #{repo[:commits]} | #{repo[:pull_requests]} | #{repo[:issues]} | #{repo[:stars]} |\n"
-        end
-        
-        markdown << "\n"
-      end
-      
-      # If we have Gemini analysis, display it with users sorted by contribution score
-      if users_with_gemini_activity && !users_with_gemini_activity.empty?
-        user_activity = []
-        
-        # Convert to the format expected by the active users table
-        users_with_gemini_activity.each do |username, analysis|
-          user_activity << {
-            username: username,
-            commit_count: analysis[:changes] || 0,
-            gemini_analysis: analysis
-          }
-        end
-        
-        markdown << self.class.generate_active_users_table(user_activity, results)
-      else
-        # Use traditional user activity table if no Gemini analysis
-        markdown << self.class.generate_combined_user_table(combined_users, users_with_gemini_activity, inactive_users, commits_by_user)
-      end
-      
-      # Skip organization-specific detail for concise output
-      return markdown if @config.concise_output
-      
-      # Add organization-specific information
-      organizations.each do |org_name|
-        org_data = results[org_name]
-        next if org_data.nil? || !org_data.is_a?(Hash) || org_data.empty?
-        
-        markdown << "## #{org_name.to_s} Organization Summary\n\n"
-        
-        # Calculate statistics for this organization
-        active_user_count = 0
-        active_repos_in_org = []
-        
-        org_data.each do |username, user_data|
-          next if username == :_meta
-          
-          if user_data.is_a?(Hash)
-            changes = user_data[:changes].to_i rescue 0
-            active_user_count += 1 if changes > 0
-          end
-        end
-        
-        # Organization Summary Table
+        # Create a summary statistics table
         markdown << "| Metric | Value |\n"
         markdown << "| --- | --- |\n"
-        markdown << "| Active Users | #{active_user_count} |\n"
-        
-        # Add repository statistics if available
-        if org_data[:_meta] && org_data[:_meta][:repo_stats]
-          repo_stats = org_data[:_meta][:repo_stats]
-          active_repos_count = 0
-          total_org_commits = 0
+        markdown << "| **Time Period** | #{stats["period"] || "Last 7 days"} |\n"
+        markdown << "| **Total Commits** | #{stats["total_commits"] || 0} |\n"
+        markdown << "| **Total Lines Changed** | #{stats["total_lines_changed"] || 0} |\n"
+        markdown << "| **Active Developers** | #{stats["active_users_count"] || 0} |\n"
+        markdown << "| **Active Repositories** | #{stats["active_repos_count"] || 0} |\n"
+      end
+      
+      # Add active users section
+      markdown << "\n## Active Users\n\n"
+      
+      # Collect all active users from all organizations and merge by username
+      merged_users = {}
+      
+      if results.is_a?(Hash)
+        results.each do |org_name, org_data|
+          next if org_name == :_meta || org_name == "_meta" || org_name == "summary_statistics" || !org_data.is_a?(Hash)
           
-          if repo_stats.is_a?(Array)
-            active_repos_count = repo_stats.count { |r| r[:total_commits].to_i > 0 if r.is_a?(Hash) }
-            total_org_commits = repo_stats.sum { |r| r[:total_commits].to_i if r.is_a?(Hash) }
+          # Get users who have activity
+          org_data.each do |username, user_data|
+            next if username == "_meta" || username == :_meta || !user_data.is_a?(Hash)
             
-            repo_stats.each do |repo|
-              next unless repo.is_a?(Hash) && repo[:total_commits].to_i > 0
-              active_repos_in_org << repo[:name] if repo[:name]
+            # Check if user has any meaningful activity
+            has_activity = false
+            
+            # Check if user has commits
+            if user_data["commits"].is_a?(Array) && !user_data["commits"].empty?
+              has_activity = true
             end
-          elsif repo_stats.is_a?(Hash)
-            active_repos_count = repo_stats.count { |_, r| r[:total_commits].to_i > 0 if r.is_a?(Hash) }
-            total_org_commits = repo_stats.sum { |_, r| r[:total_commits].to_i if r.is_a?(Hash) }
             
-            repo_stats.each do |repo_name, repo|
-              next unless repo.is_a?(Hash) && repo[:total_commits].to_i > 0
-              active_repos_in_org << repo_name
+            # Check for various activity indicators
+            has_activity ||= user_data["commits_count"].to_i > 0 if user_data["commits_count"]
+            has_activity ||= user_data["commit_count"].to_i > 0 if user_data["commit_count"]
+            has_activity ||= user_data["prs_count"].to_i > 0 if user_data["prs_count"]
+            has_activity ||= user_data["pr_count"].to_i > 0 if user_data["pr_count"]
+            has_activity ||= user_data["lines_changed"].to_i > 0 if user_data["lines_changed"]
+            
+            if has_activity
+              # Initialize merged user if doesn't exist
+              unless merged_users[username]
+                merged_users[username] = {
+                  username: username,
+                  lines_changed: 0,
+                  total_score: 0,
+                  contribution_weights: {
+                    "lines_of_code" => 0,
+                    "complexity" => 0,
+                    "technical_depth" => 0,
+                    "scope" => 0,
+                    "pr_reviews" => 0
+                  },
+                  organizations: [],
+                  org_details: {}
+                }
+              end
+              
+              # Add this organization to the list
+              org_details = merged_users[username][:org_details][org_name] = {
+                data: user_data,
+                lines_changed: user_data["lines_changed"].to_i
+              }
+              
+              # Add organization to list if not present
+              unless merged_users[username][:organizations].include?(org_name)
+                merged_users[username][:organizations] << org_name
+              end
+              
+              # Add lines changed
+              merged_users[username][:lines_changed] += user_data["lines_changed"].to_i
+              
+              # Use highest score
+              user_score = user_data["total_score"].to_i
+              if user_score > merged_users[username][:total_score]
+                merged_users[username][:total_score] = user_score
+              end
+              
+              # Use highest contribution weights
+              if user_data["contribution_weights"].is_a?(Hash)
+                weights = user_data["contribution_weights"]
+                ["lines_of_code", "complexity", "technical_depth", "scope", "pr_reviews"].each do |key|
+                  weight_value = weights[key].to_i rescue 0
+                  if weight_value > merged_users[username][:contribution_weights][key]
+                    merged_users[username][:contribution_weights][key] = weight_value
+                  end
+                end
+              end
             end
           end
+        end
+      end
+      
+      active_users = merged_users.values
+      
+      if active_users.empty?
+        markdown << "No active users found in the specified time period.\n\n"
+      else
+        # Create a table of active users with scores
+        markdown << "| Username | Organizations | Lines Changed | Contribution Score | Code | Complexity | Tech Depth | Scope | Reviews |\n"
+        markdown << "| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n"
+        
+        active_users.sort_by { |u| -1 * u[:total_score] }.each do |user|
+          username = user[:username]
+          orgs = user[:organizations].join(", ")
+          lines_changed = user[:lines_changed]
+          score = user[:total_score]
           
-          markdown << "| Active Repositories | #{active_repos_count} |\n"
-          markdown << "| Total Commits | #{total_org_commits} |\n"
+          # Extract contribution weights
+          weights = user[:contribution_weights]
+          code_weight = weights["lines_of_code"].to_i
+          complexity_weight = weights["complexity"].to_i
+          tech_depth_weight = weights["technical_depth"].to_i
+          scope_weight = weights["scope"].to_i
+          reviews_weight = weights["pr_reviews"].to_i
+          
+          markdown << "| #{username} | #{orgs} | #{lines_changed} | #{score} | #{code_weight} | #{complexity_weight} | #{tech_depth_weight} | #{scope_weight} | #{reviews_weight} |\n"
         end
         
         markdown << "\n"
         
-        # User activity in this organization
-        active_users = org_data.keys.select do |username|
-          next if username == :_meta
-          user_data = org_data[username]
-          next unless user_data.is_a?(Hash)
-          
-          # User is active if they have any changes
-          changes = user_data[:changes].to_i rescue 0
-          changes > 0
-        end
+        # Add detailed breakdown for each user
+        markdown << "## User Activity Details\n\n"
         
-        if active_user_count > 0
-          markdown << "#### User Activity\n\n"
-          markdown << "| User | Commits | PR Reviews | Contribution Score | Summary |\n"
-          markdown << "| --- | --- | --- | --- | --- |\n"
+        active_users.sort_by { |u| -1 * u[:total_score] }.each do |user|
+          username = user[:username]
+          orgs = user[:organizations].join(", ")
           
-          # Create table rows for active users
-          active_users.each do |username|
-            user_data = org_data[username]
+          markdown << "### #{username} (#{orgs})\n\n"
+          
+          # Collect summaries from all organizations
+          summaries = []
+          repositories = []
+          
+          user[:organizations].each do |org_name|
+            org_data = user[:org_details][org_name]
+            next unless org_data
             
-            # Skip users with no changes
-            next unless user_data[:changes].to_i > 0 || user_data[:pr_count].to_i > 0
-            
-            # Create table row
-            markdown << "| **#{username}** | #{user_data[:changes]} | #{user_data[:pr_count]} | #{user_data[:contribution_score]} | #{user_data[:summary]} |\n"
-          end
-          
-          markdown << "\n"
-        end
-        
-        # Repository activity in this organization if available
-        if org_data[:_meta] && org_data[:_meta][:repo_stats] && org_data[:_meta][:repo_stats].any?
-          markdown << "#### Repository Activity\n\n"
-          markdown << "| Repository | Commits | PRs | Contributors |\n"
-          markdown << "| --- | --- | --- | --- |\n"
-          
-          repo_stats = org_data[:_meta][:repo_stats]
-          
-          if repo_stats.is_a?(Array)
-            repo_stats.each do |repo|
-              next unless repo.is_a?(Hash)
-              
-              markdown << "| #{repo[:name]} | #{repo[:total_commits]} | #{repo[:open_prs]} | #{repo[:contributors_count]} |\n"
+            # Add user summary if available
+            if org_data[:data]["summary"].is_a?(String) && !org_data[:data]["summary"].empty?
+              summaries << org_data[:data]["summary"]
             end
-          elsif repo_stats.is_a?(Hash)
-            repo_stats.each do |repo_name, repo|
-              next unless repo.is_a?(Hash)
-              
-              markdown << "| #{repo_name} | #{repo[:total_commits]} | #{repo[:open_prs]} | #{repo[:contributors_count]} |\n"
+            
+            # Collect repositories
+            if org_data[:data]["projects"].is_a?(Array)
+              org_data[:data]["projects"].each do |project|
+                if project.is_a?(Hash)
+                  repo_name = project["name"] || project[:name] || "Unknown repository"
+                  commits = project["commits"] || project[:commits] || 0
+                  changes = project["lines_changed"] || project[:lines_changed] || 0
+                  
+                  repositories << {
+                    name: repo_name,
+                    org: org_name,
+                    commits: commits,
+                    changes: changes
+                  }
+                else
+                  # Handle case where project is just a string with repo name
+                  repo_name = project.to_s
+                  repositories << {
+                    name: repo_name,
+                    org: org_name,
+                    commits: 0,
+                    changes: 0
+                  }
+                end
+              end
             end
           end
           
-          markdown << "\n"
+          # Output the summary if available
+          if summaries.any?
+            # Find the longest summary
+            best_summary = summaries.max_by(&:length)
+            markdown << "> #{best_summary}\n\n"
+          end
+          
+          # Add repositories
+          if repositories.any?
+            markdown << "**Repositories:**\n\n"
+            repositories.each do |repo|
+              if repo[:commits] > 0 || repo[:changes] > 0
+                markdown << "- #{repo[:name]} (#{repo[:org]}): #{repo[:commits]} commits, #{repo[:changes]} lines changed\n"
+              else
+                markdown << "- #{repo[:name]} (#{repo[:org]})\n"
+              end
+            end
+            markdown << "\n"
+          end
+          
+          # Add languages if available (combining from all orgs)
+          all_languages = {}
+          user[:organizations].each do |org_name|
+            org_data = user[:org_details][org_name]
+            next unless org_data
+            
+            if org_data[:data]["language_distribution"].is_a?(Hash) && !org_data[:data]["language_distribution"].empty?
+              org_data[:data]["language_distribution"].each do |lang, percentage|
+                all_languages[lang] ||= 0
+                all_languages[lang] += percentage.to_f
+              end
+            end
+          end
+          
+          if all_languages.any?
+            # Normalize percentages
+            total = all_languages.values.sum
+            all_languages.each { |lang, value| all_languages[lang] = (value / total * 100) }
+            
+            markdown << "**Languages Used:**\n\n"
+            all_languages.sort_by { |_, v| -v }.each do |lang, percentage|
+              markdown << "- #{lang}: #{percentage.round(1)}%\n"
+            end
+            markdown << "\n"
+          end
+          
+          # Add recent commit messages combining from all orgs
+          all_commits = []
+          user[:organizations].each do |org_name|
+            org_data = user[:org_details][org_name]
+            next unless org_data
+            
+            if org_data[:data]["recent_commits"].is_a?(Array) && !org_data[:data]["recent_commits"].empty?
+              org_data[:data]["recent_commits"].each do |commit|
+                message = commit["message"] || commit[:message]
+                repo = commit["repository"] || commit[:repository]
+                all_commits << {
+                  message: message,
+                  repo: repo,
+                  org: org_name
+                }
+              end
+            elsif org_data[:data]["commits"].is_a?(Array) && !org_data[:data]["commits"].empty?
+              org_data[:data]["commits"].each do |commit|
+                message = commit["message"] || commit[:message] || "No message"
+                repo = commit["repository"] || commit[:repository] || "Unknown repository"
+                all_commits << {
+                  message: message,
+                  repo: repo,
+                  org: org_name
+                }
+              end
+            end
+          end
+          
+          if all_commits.any?
+            markdown << "**Recent Work:**\n\n"
+            all_commits.take(5).each do |commit|
+              markdown << "- #{commit[:repo]} (#{commit[:org]}): #{commit[:message]}\n"
+            end
+            markdown << "\n"
+          end
         end
       end
       
-      # Inactive users across all organizations
-      inactive_users = combined_users.keys.reject { |username| active_users.include?(username) || username == :_meta }
-      
-      if inactive_users.any?
-        markdown << "### Inactive Users (Across All Organizations)\n\n"
-        markdown << "| Username | Organizations |\n"
-        markdown << "| --- | --- |\n"
-        
-        inactive_users.each do |username|
-          next if username == :_meta  # Skip metadata in inactive users list
-          user_data = combined_users[username]
-          orgs = user_data[:organizations].to_a.join(', ')
-          markdown << "| #{username} | #{orgs} |\n"
-        end
-        
-        markdown << "\n"
-      end
-      
-      markdown
+      return markdown
     end
 
     def self.generate_active_users_table(user_activity, org_activity)
@@ -322,11 +339,13 @@ module GithubDailyDigest
         # Calculate total score as sum of all weights
         total_score = 0
         if weights
-          total_score += weights["lines_of_code"].to_i rescue 0
-          total_score += weights["complexity"].to_i rescue 0
-          total_score += weights["technical_depth"].to_i rescue 0
-          total_score += weights["scope"].to_i rescue 0
-          total_score += weights["pr_reviews"].to_i rescue 0
+          if weights.is_a?(Hash)
+            total_score += weights["lines_of_code"].to_i rescue 0
+            total_score += weights["complexity"].to_i rescue 0
+            total_score += weights["technical_depth"].to_i rescue 0
+            total_score += weights["scope"].to_i rescue 0
+            total_score += weights["pr_reviews"].to_i rescue 0
+          end
         end
         
         # Use the total_score from analysis if it exists, otherwise use calculated score
@@ -481,11 +500,11 @@ module GithubDailyDigest
         total_score = 0
         if weights
           if weights.is_a?(Hash)
-            total_score += weights["lines_of_code"].to_i || weights[:lines_of_code].to_i || 0
-            total_score += weights["complexity"].to_i || weights[:complexity].to_i || 0
-            total_score += weights["technical_depth"].to_i || weights[:technical_depth].to_i || 0
-            total_score += weights["scope"].to_i || weights[:scope].to_i || 0
-            total_score += weights["pr_reviews"].to_i || weights[:pr_reviews].to_i || 0
+            total_score += weights["lines_of_code"].to_i rescue 0
+            total_score += weights["complexity"].to_i rescue 0
+            total_score += weights["technical_depth"].to_i rescue 0
+            total_score += weights["scope"].to_i rescue 0
+            total_score += weights["pr_reviews"].to_i rescue 0
           end
         end
         
@@ -575,178 +594,187 @@ module GithubDailyDigest
       # Collect all users with commit data
       commits_by_user = {}
       
+      # Skip specific keys that aren't organizations
+      skip_keys = ["_meta", :_meta, "summary_statistics", :summary_statistics]
+      
       # Get all organizations from the results
-      organizations = results.keys.reject { |k| k == :_meta }
+      organizations = results.keys.select do |k| 
+        !skip_keys.include?(k)
+      end
       
       # Collect all users across all organizations
       organizations.each do |org_name|
-        next if org_name == :_meta  # Skip metadata in organizations list
-        org_data = results[org_name]
-        next if org_data.nil? || !org_data.is_a?(Hash) || org_data.empty?
+        next if skip_keys.include?(org_name)
         
-        logger.info("Processing organization #{org_name} with #{org_data.keys.size} users")
+        # Skip if this is not an organization data hash
+        next unless results[org_name].is_a?(Hash)
         
-        org_data.each do |username, user_data|
-          next if username == :_meta # Skip metadata entries
-          next unless user_data.is_a?(Hash)
+        if results[org_name].key?("users")
+          org_users = results[org_name]["users"]
+          logger.info("Processing organization #{org_name} with #{org_users.keys.size} users")
           
-          combined_users[username] ||= {
-            commits: 0,
-            pr_reviews: 0,
-            projects: Set.new,
-            organizations: Set.new,
-            contribution_score: 0,
-            lines_changed: 0,
-          }
-          
-          # Add organization name
-          combined_users[username][:organizations].add(org_name)
-          
-          # Add commit count - ensure it's an integer
-          commits = user_data[:changes].to_i rescue 0
-          commits = user_data["changes"].to_i if commits == 0 && user_data["changes"]
-          
-          combined_users[username][:commits] += commits
-          
-          # Track commits by user
-          if commits > 0
-            commits_by_user[username] ||= 0
-            commits_by_user[username] += commits
-          end
-          
-          # Extract PR count and add it
-          pr_count = user_data[:pr_count].to_i rescue 0
-          pr_count = user_data["pr_count"].to_i if pr_count == 0 && user_data["pr_count"]
-          
-          combined_users[username][:pr_reviews] += pr_count
-          
-          # Extract total score if available
-          if user_data[:total_score].to_i > 0 
-            combined_users[username][:contribution_score] = [
-              combined_users[username][:contribution_score],
-              user_data[:total_score].to_i
-            ].max
-          elsif user_data["total_score"].to_i > 0
-            combined_users[username][:contribution_score] = [
-              combined_users[username][:contribution_score],
-              user_data["total_score"].to_i
-            ].max
-          end
+          org_users.each do |username, user_data|
+            next if username == :_meta || username == "_meta" # Skip metadata entries
+            next unless user_data.is_a?(Hash)
             
-          # Extract lines changed
-          lines_changed = user_data[:lines_changed].to_i rescue 0
-          lines_changed = user_data["lines_changed"].to_i if lines_changed == 0 && user_data["lines_changed"]
-          
-          combined_users[username][:lines_changed] += lines_changed
-          
-          # Extract projects data
-          if user_data[:projects] || user_data["projects"]
-            extracted_projects = user_data[:projects] || user_data["projects"] || []
-            if extracted_projects.is_a?(Array) 
-              extracted_projects.each do |project|
-                combined_users[username][:projects].add(project) if project && !project.empty?
-              end
-            elsif extracted_projects.is_a?(String)
-              combined_users[username][:projects].add(extracted_projects) if !extracted_projects.empty?
-            end
-          end
-          
-          # Check for Gemini activity data
-          has_activity = commits > 0 || 
-                         combined_users[username][:contribution_score] > 0 || 
-                         lines_changed > 0 || 
-                         pr_count > 0
-          
-          # Save Gemini analysis data if it exists
-          if has_activity
-            logger.info("User #{username} has Gemini activity data")
-            
-            users_with_gemini_activity[username] ||= {
-              changes: 0,
+            combined_users[username] ||= {
+              commits: 0,
+              pr_reviews: 0,
+              projects: Set.new,
+              organizations: Set.new,
               contribution_score: 0,
               lines_changed: 0,
-              pr_count: 0,
-              projects: [],
-              summary: "",
-              org_name: org_name,
-              contribution_weights: {
-                "lines_of_code" => 0,
-                "complexity" => 0,
-                "technical_depth" => 0,
-                "scope" => 0,
-                "pr_reviews" => 0
-              }
             }
             
-            # Update with this organization's data
-            users_with_gemini_activity[username][:changes] += commits if commits > 0
-            users_with_gemini_activity[username][:pr_count] += pr_count if pr_count > 0
+            # Add organization name
+            combined_users[username][:organizations].add(org_name)
+            
+            # Add commit count - ensure it's an integer
+            commits = user_data[:changes].to_i rescue 0
+            commits = user_data["changes"].to_i if commits == 0 && user_data["changes"]
+            
+            combined_users[username][:commits] += commits
+            
+            # Track commits by user
+            if commits > 0
+              commits_by_user[username] ||= 0
+              commits_by_user[username] += commits
+            end
+            
+            # Extract PR count and add it
+            pr_count = user_data[:pr_count].to_i rescue 0
+            pr_count = user_data["pr_count"].to_i if pr_count == 0 && user_data["pr_count"]
+            
+            combined_users[username][:pr_reviews] += pr_count
             
             # Extract total score if available
             if user_data[:total_score].to_i > 0 
-              users_with_gemini_activity[username][:contribution_score] = [
-                users_with_gemini_activity[username][:contribution_score],
+              combined_users[username][:contribution_score] = [
+                combined_users[username][:contribution_score],
                 user_data[:total_score].to_i
               ].max
             elsif user_data["total_score"].to_i > 0
-              users_with_gemini_activity[username][:contribution_score] = [
-                users_with_gemini_activity[username][:contribution_score],
+              combined_users[username][:contribution_score] = [
+                combined_users[username][:contribution_score],
                 user_data["total_score"].to_i
               ].max
             end
             
-            users_with_gemini_activity[username][:lines_changed] += lines_changed if lines_changed > 0
+            # Extract lines changed
+            lines_changed = user_data[:lines_changed].to_i rescue 0
+            lines_changed = user_data["lines_changed"].to_i if lines_changed == 0 && user_data["lines_changed"]
             
-            # Extract contribution weights if they exist
-            if user_data[:contribution_weights].is_a?(Hash) || user_data["contribution_weights"].is_a?(Hash)
-              weights = user_data[:contribution_weights] || user_data["contribution_weights"]
-              
-              if weights.is_a?(Hash)
-                # Copy each weight, using the highest value if it already exists
-                ["lines_of_code", "complexity", "technical_depth", "scope", "pr_reviews"].each do |key|
-                  # Try string or symbol key in the source weights
-                  weight_value = weights[key].to_i rescue weights[key.to_sym].to_i rescue 0
-                  
-                  # Update if the new value is higher
-                  current_value = users_with_gemini_activity[username][:contribution_weights][key].to_i
-                  if weight_value > current_value
-                    users_with_gemini_activity[username][:contribution_weights][key] = weight_value
-                  end
-                end
-                
-                logger.debug("Updated contribution_weights for #{username}: #{users_with_gemini_activity[username][:contribution_weights].inspect}")
-              end
-            end
+            combined_users[username][:lines_changed] += lines_changed
             
-            # Calculate total score if not already set
-            if users_with_gemini_activity[username][:contribution_score] == 0
-              total = 0
-              users_with_gemini_activity[username][:contribution_weights].each do |key, value|
-                total += value.to_i
-              end
-              users_with_gemini_activity[username][:contribution_score] = total
-              logger.debug("Calculated total score for #{username}: #{total}")
-            end
-            
-            # Extract summary
-            if user_data[:summary] || user_data["summary"]
-              summary = user_data[:summary] || user_data["summary"]
-              if summary && !summary.empty? && summary != "No activity detected in the specified time window."
-                users_with_gemini_activity[username][:summary] = summary
-              end
-            end
-            
-            # Add projects
+            # Extract projects data
             if user_data[:projects] || user_data["projects"]
               extracted_projects = user_data[:projects] || user_data["projects"] || []
-              if extracted_projects.is_a?(Array)
-                users_with_gemini_activity[username][:projects] += extracted_projects
-              elsif extracted_projects.is_a?(String) && !extracted_projects.empty?
-                users_with_gemini_activity[username][:projects] << extracted_projects
+              if extracted_projects.is_a?(Array) 
+                extracted_projects.each do |project|
+                  combined_users[username][:projects].add(project) if project && !project.empty?
+                end
+              elsif extracted_projects.is_a?(String)
+                combined_users[username][:projects].add(extracted_projects) if !extracted_projects.empty?
+              end
+            end
+            
+            # Check for Gemini activity data
+            has_activity = commits > 0 || 
+                           combined_users[username][:contribution_score] > 0 || 
+                           lines_changed > 0 || 
+                           pr_count > 0
+            
+            # Save Gemini analysis data if it exists
+            if has_activity
+              logger.info("User #{username} has Gemini activity data")
+              
+              users_with_gemini_activity[username] ||= {
+                changes: 0,
+                contribution_score: 0,
+                lines_changed: 0,
+                pr_count: 0,
+                projects: [],
+                summary: "",
+                org_name: org_name,
+                contribution_weights: {
+                  "lines_of_code" => 0,
+                  "complexity" => 0,
+                  "technical_depth" => 0,
+                  "scope" => 0,
+                  "pr_reviews" => 0
+                }
+              }
+              
+              # Update with this organization's data
+              users_with_gemini_activity[username][:changes] += commits if commits > 0
+              users_with_gemini_activity[username][:pr_count] += pr_count if pr_count > 0
+              
+              # Extract total score if available
+              if user_data[:total_score].to_i > 0 
+                users_with_gemini_activity[username][:contribution_score] = [
+                  users_with_gemini_activity[username][:contribution_score],
+                  user_data[:total_score].to_i
+                ].max
+              elsif user_data["total_score"].to_i > 0
+                users_with_gemini_activity[username][:contribution_score] = [
+                  users_with_gemini_activity[username][:contribution_score],
+                  user_data["total_score"].to_i
+                ].max
               end
               
-              # Ensure uniqueness of projects
-              users_with_gemini_activity[username][:projects].uniq!
+              users_with_gemini_activity[username][:lines_changed] += lines_changed if lines_changed > 0
+              
+              # Extract contribution weights if they exist
+              if user_data[:contribution_weights].is_a?(Hash) || user_data["contribution_weights"].is_a?(Hash)
+                weights = user_data[:contribution_weights] || user_data["contribution_weights"]
+                
+                if weights.is_a?(Hash)
+                  # Copy each weight, using the highest value if it already exists
+                  ["lines_of_code", "complexity", "technical_depth", "scope", "pr_reviews"].each do |key|
+                    # Try string or symbol key in the source weights
+                    weight_value = weights[key].to_i rescue weights[key.to_sym].to_i rescue 0
+                    
+                    # Update if the new value is higher
+                    current_value = users_with_gemini_activity[username][:contribution_weights][key].to_i
+                    if weight_value > current_value
+                      users_with_gemini_activity[username][:contribution_weights][key] = weight_value
+                    end
+                  end
+                  
+                  logger.debug("Updated contribution_weights for #{username}: #{users_with_gemini_activity[username][:contribution_weights].inspect}")
+                end
+              end
+              
+              # Calculate total score if not already set
+              if users_with_gemini_activity[username][:contribution_score] == 0
+                total = 0
+                users_with_gemini_activity[username][:contribution_weights].each do |key, value|
+                  total += value.to_i
+                end
+                users_with_gemini_activity[username][:contribution_score] = total
+                logger.debug("Calculated total score for #{username}: #{total}")
+              end
+              
+              # Extract summary
+              if user_data[:summary] || user_data["summary"]
+                summary = user_data[:summary] || user_data["summary"]
+                if summary && !summary.empty? && summary != "No activity detected in the specified time window."
+                  users_with_gemini_activity[username][:summary] = summary
+                end
+              end
+              
+              # Add projects
+              if user_data[:projects] || user_data["projects"]
+                extracted_projects = user_data[:projects] || user_data["projects"] || []
+                if extracted_projects.is_a?(Array)
+                  users_with_gemini_activity[username][:projects] += extracted_projects
+                elsif extracted_projects.is_a?(String) && !extracted_projects.empty?
+                  users_with_gemini_activity[username][:projects] << extracted_projects
+                end
+                
+                # Ensure uniqueness of projects
+                users_with_gemini_activity[username][:projects].uniq!
+              end
             end
           end
         end

@@ -10,6 +10,8 @@ module GithubDailyDigest
     # Keys expected in the Gemini JSON response
     EXPECTED_KEYS = %w[projects changes contribution_weights pr_count summary lines_changed].freeze
 
+    attr_reader :client
+
     def initialize(api_key:, logger:, config:, github_graphql_service:)
       @logger = logger
       @config = config
@@ -72,6 +74,93 @@ module GithubDailyDigest
         @logger.error("Unexpected error analyzing #{username}'s activity: #{e.message}")
         @logger.warn("Using fallback analysis due to error.")
         return create_fallback_analysis(username, commits, review_count)
+      end
+    end
+
+    def analyze_user_activity(username, user_data)
+      @logger.info("Analyzing activity for user: #{username}")
+      
+      # Return early if no data
+      return {} if user_data.nil? || user_data.empty?
+      
+      # Extract relevant data for analysis
+      commits = user_data[:commits] || []
+      reviews = user_data[:reviews] || []
+      
+      if commits.empty? && reviews.empty?
+        @logger.info("No activity found for user: #{username}")
+        return {}
+      end
+      
+      review_count = reviews.size
+      @logger.info("Fetching code changes for #{commits.size} of #{commits.size} commits")
+      
+      # Fetch detailed commit changes for all commits
+      commit_changes = []
+      all_files = []
+      
+      commits.each do |commit|
+        # Skip commits without necessary information
+        next unless commit[:repo_name] && commit[:sha]
+        
+        changes = @github_graphql_service.fetch_commit_changes(commit[:repo_name], commit[:sha])
+        
+        if changes && !changes.empty?
+          commit_changes << changes
+          
+          # Collect files for language analysis
+          if changes[:files] && !changes[:files].empty?
+            all_files.concat(changes[:files])
+          end
+        end
+      end
+      
+      @logger.info("Successfully fetched changes for #{commit_changes.size} commits")
+      
+      # Calculate language distribution
+      language_stats = {}
+      require_relative './language_analyzer'
+      language_stats = LanguageAnalyzer.calculate_distribution(all_files)
+      
+      if commit_changes.empty?
+        @logger.warn("No commit changes found for user: #{username}")
+        
+        # Create fallback analysis for users with review activity but no commit activity
+        if review_count > 0
+          fallback = create_fallback_analysis(username, [], review_count)
+          fallback["language_distribution"] = {}
+          return fallback
+        end
+        
+        return {}
+      end
+      
+      # Perform Gemini analysis
+      begin
+        # Package commit data for analysis
+        analysis_data = {
+          username: username,
+          commits: commit_changes,
+          reviews: review_count
+        }
+        
+        analysis_result = analyze_activity(analysis_data[:username], analysis_data[:commits], analysis_data[:reviews], 30)
+        
+        # Add language distribution to the analysis result
+        if analysis_result
+          analysis_result["language_distribution"] = language_stats
+        end
+        
+        # Return the completed analysis
+        analysis_result || create_fallback_analysis(username, commit_changes, review_count)
+      rescue => e
+        @logger.error("Error analyzing user activity for #{username}: #{e.message}")
+        @logger.error(e.backtrace.join("\n"))
+        
+        # Create fallback analysis in case of error
+        fallback = create_fallback_analysis(username, commit_changes, review_count)
+        fallback["language_distribution"] = language_stats
+        fallback
       end
     end
 

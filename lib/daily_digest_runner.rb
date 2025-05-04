@@ -10,7 +10,7 @@ require_relative 'github_graphql_service'
 require_relative 'activity_analyzer'
 require_relative 'gemini_service'
 require_relative 'output_formatter'
-
+require_relative 'html_formatter'
 
 module GithubDailyDigest
   class DailyDigestRunner
@@ -52,37 +52,56 @@ module GithubDailyDigest
     end
 
     def run
-      org_names = @config.github_org_names
-      @logger.info("Starting daily digest process for organization(s): #{org_names.join(', ')}")
-      @logger.info("Fetching data since: #{@config.time_since}")
-      @logger.info("Using GraphQL API: #{@use_graphql ? 'Yes' : 'No'}")
-
-      # Initialize results hash
-      all_org_results = {}
+      @logger.info("Starting GitHub Daily Digest")
+      @logger.debug("Debug mode enabled with log level: #{@logger.level}")
       
-      # Process each organization separately
-      org_names.each_with_index do |org_name, index|
-        @logger.info("===== Processing organization: #{org_name} (#{index+1}/#{org_names.size}) =====")
-        
-        org_results = process_organization(org_name)
-        
-        # Add results to the combined hash, using org name as namespace
-        all_org_results[org_name] = org_results
+      # Verify GitHub authentication via the client
+      @logger.info("Verifying GitHub authentication...")
+      begin
+        user = @github_service.get_current_user
+        if user
+          @logger.info("Authenticated to GitHub as user: #{user[:login]}")
+        else
+          @logger.fatal("GitHub authentication failed: Unable to get user information")
+          return false
+        end
+      rescue => e
+        @logger.fatal("GitHub authentication failed: #{e.message}")
+        @logger.debug("Authentication error backtrace: #{e.backtrace.join("\n")}")
+        return false
       end
       
-      # Save results to file if not in JSON-only mode
-      save_results(all_org_results) unless @config.json_only
+      # Log where results will be output
+      if @config.output_to_stdout
+        @logger.info("Results will be output directly")
+      else
+        @logger.info("Results will be saved to file")
+      end
       
-      @logger.info("Daily digest process completed successfully for all organizations.")
+      # Process all organization data
+      @logger.info("Starting daily digest process for organization(s): #{@config.github_org_name}")
+      @logger.info("Fetching data since: #{@config.time_since}")
+      @logger.info("Using GraphQL API: #{@use_graphql ? 'Yes' : 'No'}")
+      @logger.info("Output format: #{@config.output_formats}")
       
-      # Return the results with organization structure
-      return all_org_results
-
-    rescue => e # Catch errors during initialization or top-level execution
-       @logger.fatal("Critical error during Daily Digest run: #{e.message}")
-       @logger.fatal(e.backtrace.join("\n"))
-       # Return an error object
-       return { error: e.message, backtrace: e.backtrace }
+      begin
+        results_by_org = process_organizations
+        
+        # Process results into desired format (JSON, Markdown, or HTML)
+        @logger.info("Processing results into #{@config.output_formats} format")
+        result = process_results(results_by_org, @config.specific_users)
+        
+        @logger.info("Execution finished successfully.")
+        return true
+      rescue => e
+        @logger.fatal("Error during execution: #{e.message}")
+        @logger.error("Error backtrace: #{e.backtrace.join("\n")}")
+        return false
+      end
+    rescue => e
+      @logger.fatal("Unhandled error: #{e.message}")
+      @logger.error("Unhandled error backtrace: #{e.backtrace.join("\n")}")
+      return false
     end
 
     # Process a single organization
@@ -118,6 +137,31 @@ module GithubDailyDigest
         # Restore original org name in config
         @config.instance_variable_set(:@github_org_name, original_org_name)
       end
+    end
+
+    # Process all organizations and return combined results
+    def process_organizations
+      org_names = @config.github_org_names
+      
+      # Initialize results hash
+      all_org_results = {}
+      
+      # Process each organization separately
+      org_names.each_with_index do |org_name, index|
+        @logger.info("===== Processing organization: #{org_name} (#{index+1}/#{org_names.size}) =====")
+        
+        org_results = process_organization(org_name)
+        
+        # Add results to the combined hash, using org name as namespace
+        all_org_results[org_name] = org_results
+      end
+      
+      @logger.info("Daily digest process completed successfully for all organizations.")
+      
+      # Save results to file
+      save_results(all_org_results)
+      
+      return all_org_results
     end
 
     # Refactored method to process a user's activity data and analyze it
@@ -354,21 +398,534 @@ module GithubDailyDigest
       return all_user_analysis
     end
 
+    # Main function to process results from GitHub API and format them for output
+    def process_results(results, specific_users = [])
+      @logger.info("Processing results...")
+      
+      # Debug the structure of the results hash
+      @logger.info("Results structure: #{results.keys.join(', ')}")
+      
+      # Dump the first organization structure to better understand the data
+      if results.keys.first && results[results.keys.first].is_a?(Hash)
+        org_data = results[results.keys.first]
+        @logger.info("First org data keys: #{org_data.keys.join(', ')}")
+        
+        # Count total commits in all repositories
+        total_repo_commits = 0
+        
+        # Check for repository data in _meta
+        if org_data["_meta"] && org_data["_meta"]["repos"] && org_data["_meta"]["repos"].is_a?(Hash)
+          org_data["_meta"]["repos"].each do |repo_name, repo_data|
+            if repo_data["commit_count"].to_i > 0
+              @logger.info("Repository #{repo_name} has #{repo_data["commit_count"]} commits")
+              total_repo_commits += repo_data["commit_count"].to_i
+            end
+          end
+          @logger.info("Total commits in all repositories: #{total_repo_commits}")
+        end
+        
+        # Check for key users
+        org_data.keys.select { |k| k.is_a?(String) && !k.start_with?("_") }.take(3).each do |username|
+          user_data = org_data[username]
+          if user_data.is_a?(Hash)
+            @logger.info("User #{username} data keys: #{user_data.keys.join(', ')}")
+            
+            # Check for commits data structure
+            if user_data["commits"] && user_data["commits"].is_a?(Array)
+              @logger.info("User #{username} has #{user_data["commits"].size} commits as an array")
+            end
+            
+            if user_data["commit_count"]
+              @logger.info("User #{username} has 'commit_count': #{user_data["commit_count"]}")
+            end
+            
+            if user_data["commits_count"]
+              @logger.info("User #{username} has 'commits_count': #{user_data["commits_count"]}")
+            end
+          end
+        end
+      end
+      
+      # Generate summary statistics and AI description
+      results = generate_summary_statistics(results) if @config.gemini_api_key
+      
+      # Initialize the appropriate output formatter
+      output_formatter = OutputFormatter.new(
+        config: @config,
+        logger: @logger
+      )
+
+      output_results = {}
+      
+      # Process each requested output format
+      @config.output_formats.each do |output_format|
+        @logger.info("Processing results into #{output_format} format")
+        
+        case output_format
+        when 'json'
+          json_output = output_formatter.format(results, 'json')
+          if @config.output_to_stdout
+            @logger.info("Writing JSON to stdout")
+            puts json_output
+          else
+            output_file = "github_daily_digest_#{Time.now.strftime('%Y-%m-%d')}.json"
+            @logger.info("Writing JSON to file: #{output_file}")
+            File.write(output_file, json_output)
+          end
+          output_results['json'] = json_output
+          
+        when 'markdown'
+          markdown_output = output_formatter.format(results, 'markdown')
+          if @config.output_to_stdout
+            @logger.info("Writing Markdown to stdout")
+            puts markdown_output
+          else
+            output_file = "github_daily_digest_#{Time.now.strftime('%Y-%m-%d')}.md"
+            @logger.info("Writing Markdown to file: #{output_file}")
+            File.write(output_file, markdown_output)
+          end
+          output_results['markdown'] = markdown_output
+          
+        when 'html'
+          @logger.info("Processing results into html format")
+          # For HTML output, we'll use our standalone HTML formatter
+          # First, convert the data to JSON format
+          json_data = JSON.pretty_generate(results)
+          
+          if @config.output_to_stdout
+            # Generate HTML and output to stdout
+            html_formatter = HtmlFormatter.new(
+              data: results,
+              theme: @config.html_theme,
+              title: @config.html_title || "Team Activity Report - #{Time.now.strftime('%Y-%m-%d')}",
+              show_charts: true
+            )
+            html_output = html_formatter.generate
+            
+            # Output the HTML
+            puts html_output
+            
+            output_results['html'] = html_output
+          else
+            # Generate the HTML to a file
+            output_file = "#{Time.now.strftime('%Y-%m-%d')}.html"
+            html_formatter = HtmlFormatter.new(
+              data: results,
+              output_file: output_file, 
+              theme: @config.html_theme,
+              title: @config.html_title || "Team Activity Report - #{Time.now.strftime('%Y-%m-%d')}",
+              show_charts: true
+            )
+            html_formatter.generate
+            @logger.info("HTML output generated to: #{output_file}")
+            output_results['html'] = output_file
+          end
+        else
+          @logger.warn("Unknown output format: #{output_format}, skipping")
+        end
+      end
+      
+      # Return all generated outputs
+      output_results
+    end
+
+    # Format time window into a human-readable string
+    def format_time_period(time_window_days)
+      time_window = time_window_days.to_i rescue 7
+      
+      case time_window
+      when 1 then "Last 24 hours"
+      when 7 then "Last week"
+      when 30, 31 then "Last month"
+      else "Last #{time_window} days"
+      end
+    end
+
+    # Generate summary statistics and AI-generated summary description
+    def generate_summary_statistics(results)
+      @logger.info("Generating summary statistics and AI description...")
+      
+      # Calculate aggregate statistics
+      total_commits = 0
+      total_prs = 0
+      total_reviews = 0
+      total_lines_changed = 0
+      all_weights = {
+        "lines_of_code" => [],
+        "complexity" => [],
+        "technical_depth" => [],
+        "scope" => [],
+        "pr_reviews" => []
+      }
+      active_users_count = 0
+      active_repos_count = 0
+      
+      # Gather all language stats
+      all_languages = {}
+      
+      # Process each organization's data
+      results.each do |org_name, org_data|
+        next if org_name == :_meta || org_name == "_meta" || !org_data.is_a?(Hash)
+        
+        # Users are direct children of the org hash - we need to find all users
+        users_in_org = org_data.keys.reject { |key| key == "_meta" || key == :_meta }
+        
+        # Count users with commit activity
+        active_users = users_in_org.select do |username|
+          user_data = org_data[username]
+          next false unless user_data.is_a?(Hash)
+          
+          # Check for commit activity
+          commits = user_data["commits"] || user_data["commits_count"] || user_data["commit_count"] || []
+          commits.is_a?(Array) && !commits.empty?
+        end
+        
+        active_users_count += active_users.size
+        
+        # Process each user's data
+        users_in_org.each do |username|
+          user_data = org_data[username]
+          next unless user_data.is_a?(Hash)
+          
+          # Track if this user has any activity
+          has_activity = false
+          
+          # Aggregate user statistics
+          commits = user_data["commits"] || []
+          
+          # Check if this user has commits (could be an array or a count)
+          if commits.is_a?(Array) && !commits.empty?
+            total_commits += commits.size
+            has_activity = true
+          end
+          
+          if user_data["commits_count"].to_i > 0
+            total_commits += user_data["commits_count"].to_i
+            has_activity = true
+          end
+          
+          if user_data["commit_count"].to_i > 0
+            total_commits += user_data["commit_count"].to_i
+            has_activity = true
+          end
+          
+          # Count PRs
+          if user_data["prs_count"].to_i > 0
+            total_prs += user_data["prs_count"].to_i
+            has_activity = true
+          end
+          
+          if user_data["pr_count"].to_i > 0
+            total_prs += user_data["pr_count"].to_i
+            has_activity = true
+          end
+          
+          # Count reviews
+          if user_data["reviews_count"].to_i > 0
+            total_reviews += user_data["reviews_count"].to_i
+            has_activity = true
+          end
+          
+          if user_data["review_count"].to_i > 0
+            total_reviews += user_data["review_count"].to_i
+            has_activity = true
+          end
+          
+          # Count lines changed
+          if user_data["lines_changed"].to_i > 0
+            total_lines_changed += user_data["lines_changed"].to_i
+            has_activity = true
+          end
+        
+          # Collect language stats
+          if user_data["language_distribution"] && user_data["language_distribution"].is_a?(Hash)
+            user_data["language_distribution"].each do |lang, percentage|
+              all_languages[lang] ||= 0
+              all_languages[lang] += percentage.to_f
+            end
+          end
+        
+          # Process contribution weights
+          if user_data["contribution_weights"] && user_data["contribution_weights"].is_a?(Hash)
+            weights = user_data["contribution_weights"]
+            all_weights.keys.each do |key|
+              weight_value = weights[key].to_i rescue 0
+              all_weights[key] << weight_value if weight_value > 0
+            end
+          end
+          
+          # If this user had any activity, increment active users count
+          active_users_count += 1 if has_activity
+        end
+        
+        # Count active repositories from _meta.repos
+        if org_data["_meta"] && org_data["_meta"]["repos"] && org_data["_meta"]["repos"].is_a?(Hash)
+          active_repos = org_data["_meta"]["repos"].values.select do |repo|
+            repo["commit_count"].to_i > 0 if repo.is_a?(Hash) && repo["commit_count"]
+          end
+          active_repos_count += active_repos.size
+        end
+      end
+      
+      # Calculate average contribution weights
+      average_weights = {}
+      all_weights.each do |key, values|
+        average_weights[key] = values.empty? ? 0 : (values.sum.to_f / values.size).round(1)
+      end
+      
+      # Normalize language percentages
+      language_distribution = {}
+      if all_languages.any?
+        total_percentage = all_languages.values.sum
+        all_languages.each do |lang, percentage|
+          normalized = (percentage.to_f / total_percentage * 100).round(1)
+          language_distribution[lang] = normalized if normalized > 0
+        end
+      end
+      
+      # Create the formatted time period text for the summary
+      time_period = format_time_period(@config.time_window_days)
+      
+      # Generate an AI summary if Gemini is configured
+      ai_summary = nil
+      if @config.gemini_api_key
+        ai_prompt = create_summary_prompt(
+          results: results,
+          period: time_period,
+          total_commits: total_commits,
+          total_prs: total_prs,
+          total_lines_changed: total_lines_changed,
+          active_users_count: active_users_count,
+          active_repos_count: active_repos_count,
+          language_distribution: language_distribution
+        )
+        ai_summary = generate_ai_summary(ai_prompt)
+      end
+      
+      # Build the final summary statistics
+      summary_statistics = {
+        "total_commits" => total_commits,
+        "total_prs" => total_prs,
+        "total_reviews" => total_reviews,
+        "total_lines_changed" => total_lines_changed,
+        "active_users_count" => active_users_count,
+        "active_repos_count" => active_repos_count,
+        "average_weights" => average_weights,
+        "team_language_distribution" => language_distribution,
+        "period" => time_period,
+        "ai_summary" => ai_summary
+      }
+      
+      # Add the summary statistics to the results hash
+      results["summary_statistics"] = summary_statistics
+      
+      results
+    end
+    
+    # Create a prompt for the AI to generate a summary of team activity
+    def create_summary_prompt(results:, period:, total_commits:, total_prs:, total_lines_changed:, active_users_count:, active_repos_count:, language_distribution:)
+      prompt = "Create a comprehensive yet concise professional summary of team activity for the following period: #{period}.\n\n"
+      prompt += "Key metrics:\n"
+      prompt += "- Total commits: #{total_commits}\n"
+      prompt += "- Total pull requests: #{total_prs}\n"
+      prompt += "- Total lines of code changed: #{total_lines_changed}\n"
+      prompt += "- Active developers: #{active_users_count}\n"
+      prompt += "- Active repositories: #{active_repos_count}\n"
+      
+      # Add team language distribution
+      if language_distribution && !language_distribution.empty?
+        top_languages = language_distribution.sort_by { |_, percentage| -percentage }.take(5)
+        prompt += "\nTop programming languages used by the team:\n"
+        top_languages.each do |lang, percentage|
+          prompt += "- #{lang}: #{percentage.round(1)}%\n"
+        end
+      end
+      
+      # Collect information about individual developers and their work
+      if results && results.is_a?(Hash)
+        user_summaries = []
+        repositories_worked_on = []
+        
+        results.each do |org_name, org_data|
+          next if org_name == :_meta || org_name == "_meta" || org_name == "summary_statistics" || !org_data.is_a?(Hash)
+          
+          org_data.each do |username, user_data|
+            next if username == "_meta" || username == :_meta || !user_data.is_a?(Hash)
+            next unless user_data["total_score"].to_i > 0 || user_data["lines_changed"].to_i > 0
+            
+            # Gather user summary
+            if user_data["summary"].is_a?(String) && !user_data["summary"].empty?
+              user_summaries << "#{username}: #{user_data["summary"]}"
+            end
+            
+            # Gather repositories
+            if user_data["projects"].is_a?(Array)
+              @logger.info("  Found #{user_data["projects"].length} projects for user #{username}") if @logger
+              
+              user_data["projects"].each do |project|
+                begin
+                  if project.is_a?(Hash)
+                    repo_name = nil
+                    
+                    # Try to extract the name safely
+                    if project.key?("name")
+                      repo_name = project["name"].to_s
+                    elsif project.key?(:name)
+                      repo_name = project[:name].to_s
+                    end
+                    
+                    if repo_name && !repo_name.empty?
+                      repositories_worked_on << repo_name
+                    end
+                  else
+                    @logger.warn("  Skipping non-hash project for user #{username}: #{project.inspect}") if @logger
+                  end
+                rescue => e
+                  @logger.warn("  Error processing project for user #{username}: #{e.message}") if @logger
+                end
+              end
+            end
+          end
+        end
+        
+        # Add individual developer summaries
+        if user_summaries.any?
+          prompt += "\nIndividual developer summaries:\n"
+          user_summaries.take(5).each do |summary|
+            prompt += "- #{summary}\n"
+          end
+        end
+        
+        # Add repositories being worked on
+        if repositories_worked_on.any?
+          unique_repos = repositories_worked_on.uniq
+          prompt += "\nRepositories being worked on:\n"
+          unique_repos.take(10).each do |repo|
+            prompt += "- #{repo}\n"
+          end
+        end
+      end
+      
+      prompt += "\nBased on this information, provide a professional summary of the team's activity "
+      prompt += "that highlights the main focus areas, types of work being done, and overall productivity trends. "
+      prompt += "Keep it concise (3-4 sentences) and data-focused. Emphasize what the team accomplished collectively."
+      
+      return prompt
+    end
+    
+    # Build the final summary statistics
+    def build_summary_prompt(stats, results)
+      prompt = "Generate a concise 2-3 sentence summary of the following GitHub team activity:\n\n"
+      prompt += "Time period: #{stats['period']}\n"
+      prompt += "#{stats['active_users_count']} developers made #{stats['total_commits']} commits "
+      prompt += "across #{stats['active_repos_count']} repositories.\n"
+      prompt += "Total lines of code changed: #{stats['total_lines_changed']}\n"
+      
+      # Add language distribution
+      if stats["team_language_distribution"] && !stats["team_language_distribution"].empty?
+        top_languages = stats["team_language_distribution"].sort_by { |_, v| -v }.take(3)
+        prompt += "\nTop programming languages used by the team:\n"
+        top_languages.each do |lang, percentage|
+          prompt += "- #{lang}: #{percentage.round(1)}%\n"
+        end
+      end
+      
+      # Add information about most active repos if available
+      active_repos = results["organizations"]&.flat_map do |_, org|
+        org["repositories"]&.map do |name, repo|
+          { name: name, commits: repo["commit_count"] || 0 }
+        end
+      end&.compact
+      
+      if active_repos && !active_repos.empty?
+        top_repos = active_repos.sort_by { |r| -r[:commits] }.take(3)
+        prompt += "Most active repositories: #{top_repos.map { |r| r[:name] }.join(', ')}\n"
+      end
+      
+      prompt += "\nBased on this information, provide a professional summary of the team's activity "
+      prompt += "that highlights the main focus areas and overall productivity. Keep it brief and data-focused. Emphasize what the team accomplished collectively."
+      
+      return prompt
+    end
+    
+    def generate_ai_summary(prompt)
+      begin
+        @logger.info("Generating AI summary of team activity")
+        response = @gemini_service.client.generate_content({
+          contents: { role: 'user', parts: { text: prompt } },
+          generation_config: { temperature: 0.2 }
+        })
+        
+        # Extract text from the response
+        if response && response.respond_to?(:text) && response.text
+          @logger.info("Successfully generated AI summary")
+          return response.text.strip
+        elsif response.is_a?(Hash) && response['candidates'] && response['candidates'][0] && 
+            response['candidates'][0]['content'] && response['candidates'][0]['content']['parts'] && 
+            response['candidates'][0]['content']['parts'][0]
+          # Direct hash structure
+          @logger.info("Successfully generated AI summary (hash structure)")
+          return response['candidates'][0]['content']['parts'][0]['text'].to_s.strip
+        else
+          @logger.warn("Failed to generate AI summary: Empty response")
+          return "Team showed varied activity levels across multiple repositories, demonstrating collaborative development efforts."
+        end
+      rescue => e
+        @logger.error("Error generating AI summary: #{e.message}")
+        return "Team showed varied activity levels across multiple repositories, demonstrating collaborative development efforts."
+      end
+    end
+
     private
 
     def save_results(analysis_data)
-      # Log the final JSON if not in JSON-only mode
-      @logger.info("Saving analysis results to file")
-
-      # Save the JSON to a timestamped file
-      begin
-        results_dir = File.expand_path('results', Dir.pwd)
+      # Only save results to file if not outputting to stdout
+      unless @config.output_to_stdout
+        timestamp = Time.now.strftime("%Y%m%d_%H%M%S")
+        
+        # Create results directory if it doesn't exist
+        results_dir = File.join(Dir.pwd, 'results')
         Dir.mkdir(results_dir) unless Dir.exist?(results_dir)
-        results_file = File.join(results_dir, "daily_digest_#{Time.now.strftime('%Y%m%d_%H%M%S')}.json")
-        File.write(results_file, JSON.pretty_generate(analysis_data))
-        @logger.info("Analysis saved to #{results_file}")
-      rescue => e
-        @logger.error("Failed to save results JSON to file: #{e.message}")
+        
+        output_files = []
+        
+        @config.output_formats.each do |format|
+          case format
+          when 'json'
+            output_file = File.join(results_dir, "daily_digest_#{timestamp}.json")
+            output_formatter = OutputFormatter.new(config: @config, logger: @logger)
+            File.write(output_file, output_formatter.format(analysis_data, 'json'))
+            output_files << output_file
+            
+          when 'markdown'
+            output_file = File.join(results_dir, "daily_digest_#{timestamp}.md")
+            output_formatter = OutputFormatter.new(config: @config, logger: @logger)
+            File.write(output_file, output_formatter.format(analysis_data, 'markdown'))
+            output_files << output_file
+            
+          when 'html'
+            output_file = File.join(results_dir, "daily_digest_#{timestamp}.html")
+            html_formatter = HtmlFormatter.new(
+              data: analysis_data,
+              output_file: output_file, 
+              theme: @config.html_theme,
+              title: @config.html_title || "Team Activity Report - #{Time.now.strftime('%Y-%m-%d')}",
+              show_charts: true
+            )
+            html_formatter.generate
+            @logger.info("HTML output generated to: #{output_file}")
+            output_files << output_file
+          else
+            # Default to JSON
+            output_file = File.join(results_dir, "daily_digest_#{timestamp}.json")
+            output_formatter = OutputFormatter.new(config: @config, logger: @logger)
+            File.write(output_file, output_formatter.format(analysis_data, 'json'))
+            output_files << output_file
+          end
+        end
+        
+        @logger.info("Analysis saved to #{output_files.join(', ')}")
+        output_files
       end
     end
   end
